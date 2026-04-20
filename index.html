@@ -4,6 +4,15 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Tetris</title>
+    
+    <!-- PWA & Mobile Meta -->
+    <link rel="manifest" href="./manifest.json" />
+    <meta name="theme-color" content="#00f5ff" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Tetris" />
+    <link rel="apple-touch-icon" href="./icon-192.png" />
+    
     <style>
       body {
         margin: 0;
@@ -12,7 +21,18 @@
         overflow-x: hidden;
       }
     </style>
-    <script type="module" crossorigin src="./assets/index-DvDTlQs6.js"></script>
+    
+    <script>
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+          navigator.serviceWorker
+            .register("/service-worker.js")
+            .then((reg) => console.log("SW Registered:", reg.scope))
+            .catch((err) => console.error("SW Registration failed:", err));
+        });
+      }
+    </script>
+    <script type="module" crossorigin src="./assets/index-ChnUm2n-.js"></script>
   </head>
   <body>
     <div id="root"></div>
