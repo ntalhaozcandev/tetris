@@ -1,6 +1,55 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { supabase } from "./src/supabase";
 
+// ── PWA & Offline Config ───────────────────────────────────────────────────
+const SCORE_API_URL = "https://YOUR_API_ENDPOINT/scores";
+
+// IndexedDB Promise Wrapper
+const initDB = () => {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open("tetris-db", 1);
+    request.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains("scores")) {
+        const store = db.createObjectStore("scores", { keyPath: "id", autoIncrement: true });
+        store.createIndex("synced", "synced", { unique: false });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+};
+
+const saveScoreOffline = async (scoreData) => {
+  try {
+    const db = await initDB();
+    const transaction = db.transaction("scores", "readwrite");
+    const store = transaction.objectStore("scores");
+    await store.add({ ...scoreData, synced: false, date: new Date().toISOString() });
+    
+    // Background Sync Registration
+    if ("serviceWorker" in navigator && "SyncManager" in window) {
+      const registration = await navigator.serviceWorker.ready;
+      await registration.sync.register("sync-scores");
+    }
+  } catch (err) {
+    console.error("IndexedDB error:", err);
+  }
+};
+
+const triggerSyncManually = async () => {
+  if ("serviceWorker" in navigator && "SyncManager" in window) {
+    try {
+      const registration = await navigator.serviceWorker.ready;
+      await registration.sync.register("sync-scores");
+    } catch (e) { console.warn("Manual sync registration failed:", e); }
+  } else {
+    // Fallback for browsers without SyncManager (Safari)
+    console.log("SyncManager not supported, attempting manual upload...");
+    // Here we would manually call the sync logic if needed, but the SW handles fetch anyway
+  }
+};
+
 // ─── Sabitler ────────────────────────────────────────────────────────────────
 const COLS = 10;
 const ROWS = 20;
@@ -11,15 +60,18 @@ const COLORS = {
   S: "#39ff14", Z: "#ff2052", J: "#1e90ff", L: "#ff8c00",
 };
 
-// Hareket Hızı Ayarları (DAS/ARR)
-const INITIAL_DELAY = 170; // İlk hareketten sonraki bekleme (ms)
-const REPEAT_INTERVAL = 45; // Sürekli hareket hızı (ms)
+// Hareket Hızı Ayarları (DAS/ARR) - Pro Level
+const INITIAL_DELAY = 120; // İlk hareketten sonraki bekleme (ms)
+const REPEAT_INTERVAL = 25; // Sürekli hareket hızı (ms)
 const SWIPE_THRESHOLD = 14; // Hücre başına swipe mesafesi (px)
+const LOCK_DELAY = 500;     // Yere değince kilitlenme süresi (ms)
+const SOFT_LOCK_DELAY = 250; // Down tuşu ile kilitlenme süresi (ms)
+const MAX_LOCK_RESETS = 15;  // Maksimum hareketle süre sıfırlama sayısı
 
 const PIECES = {
   I: { shape: [[1,1,1,1]], color: "I" },
   O: { shape: [[1,1],[1,1]], color: "O" },
-  T: { shape: [[0,1,0],[1,1,1]], color: "T" },
+  T: { shape: [[0,1,0],[1,1,1],[0,0,0]], color: "T" },
   S: { shape: [[0,1,1],[1,1,0]], color: "S" },
   Z: { shape: [[1,1,0],[0,1,1]], color: "Z" },
   J: { shape: [[1,0,0],[1,1,1]], color: "J" },
@@ -39,6 +91,15 @@ function rotate(matrix) {
 function freshPiece(colorKey) {
   const p = PIECES[colorKey];
   return { shape: p.shape.map(r => [...r]), color: p.color, x: 3, y: 0 };
+}
+
+function getFlagEmoji(countryCode) {
+  if (!countryCode || countryCode === "??") return "🌎";
+  const codePoints = countryCode
+    .toUpperCase()
+    .split("")
+    .map(char => 127397 + char.charCodeAt());
+  return String.fromCodePoint(...codePoints);
 }
 
 function shuffleBag() {
@@ -215,6 +276,7 @@ function PauseOverlay({ settings, onChange, onResume, onResetScore, isTouch }) {
   const rows = [
     ...(isTouch ? [{ key: "showButtons", label: "Mobil Butonlar", desc: "Ekranda hareket butonlarını göster" }] : []),
     { key: "showGhost",   label: "Ghost Piece",    desc: "Parçanın düşeceği yeri göster" },
+    { key: "hideLocation", label: "Konumu Gizle",  desc: "Sıralamada şehir/ülke bilgisini gizle" },
   ];
   return (
     <div
@@ -306,9 +368,10 @@ function MobileBtn({ label, onAction, repeat = false, color = "#00f5ff", style: 
         WebkitTapHighlightColor: "transparent",
         boxShadow: `0 2px 14px ${color}18`,
         userSelect: "none",
-        transition: "background 0.08s, border-color 0.08s",
+        transition: "all 0.1s ease",
         ...extraStyle,
       }}
+      className="m-btn"
       onPointerEnter={e => { e.currentTarget.style.background = `${color}22`; e.currentTarget.style.borderColor = `${color}88`; }}
       onPointerLeave={e => { stop(); e.currentTarget.style.background = `${color}0f`; e.currentTarget.style.borderColor = `${color}44`; }}
     >
@@ -330,17 +393,27 @@ export default function Tetris() {
     hold: null,       // hold slotundaki parça
     canHold: true,    // her parçada 1 kez hold hakkı
     bag: [], bagIndex: 0,
+    inputs: {},       // Klavye giriş takibi { key: { held: bool, timer: number, repeating: bool } }
     score: 0, lines: 0, level: 1,
     gameOver: false, running: false, paused: false,
     lastTime: 0, dropInterval: 800, accumulated: 0,
+    lockTimer: 0, lockResets: 0, 
+    comboCount: -1, isBackToBack: false, lastMoveWasRotation: false, // Pro Scoring Vars
   });
 
   const [ui, setUi]             = useState({ 
     score: 0, lines: 0, level: 1, 
     bestScore: Number(localStorage.getItem("tetris_best")) || 0,
-    gameOver: false, running: false, paused: false 
+    savedNickname: localStorage.getItem("tetris_nick") || "", // Kalıcı nickname
+    gameOver: false, running: false, paused: false,
+    message: "" // Floating labels için
   });
-  const [settings, setSettings] = useState({ showButtons: true, showGhost: true });
+
+  const [settings, setSettings] = useState(() => {
+    const saved = localStorage.getItem("tetris_settings");
+    return saved ? JSON.parse(saved) : { showButtons: true, showGhost: true, hideLocation: false };
+  });
+
   const [showSettings, setShowSettings] = useState(false);
   const [isTouch, setIsTouch] = useState(false);
   const [geo, setGeo] = useState({ city: "", country: "", countryCode: "" });
@@ -351,22 +424,50 @@ export default function Tetris() {
   useEffect(() => {
     setIsTouch('ontouchstart' in window || navigator.maxTouchPoints > 0);
     
-    // Konum tespiti (Ücretsiz ve anahtarsız API)
-    fetch("https://freeipapi.com/api/json")
-      .then(res => res.json())
-      .then(data => {
-        setGeo({
-          city: data.cityName || "Bilinmiyor",
-          country: data.countryName || "Bilinmiyor",
-          countryCode: data.countryCode || ""
-        });
-      })
-      .catch(err => console.error("Konum tespiti hatası:", err));
+    // Çok Kanallı Konum Tespiti (Fallback Sistemi)
+    const fetchGeo = async () => {
+      // 1. Birincil Deneme (FreeIPAPI)
+      try {
+        const res = await fetch("https://freeipapi.com/api/json");
+        const data = await res.json();
+        if (data.cityName && data.countryName) {
+          setGeo({ city: data.cityName, country: data.countryName, countryCode: data.countryCode || "" });
+          return;
+        }
+      } catch (e) { console.warn("Primary geo failed, trying fallback..."); }
+
+      // 2. Yedek Deneme (IPApi.co)
+      try {
+        const res = await fetch("https://ipapi.co/json/");
+        const data = await res.json();
+        if (data.city && data.country_name) {
+          setGeo({ city: data.city, country: data.country_name, countryCode: data.country_code || "" });
+        }
+      } catch (e) {
+        console.error("All geo providers failed:", e);
+        setGeo({ city: "Unknown", country: "Global", countryCode: "" });
+      }
+    };
+    fetchGeo();
   }, []);
 
   useEffect(() => {
     localStorage.setItem("tetris_best", ui.bestScore);
   }, [ui.bestScore]);
+
+  useEffect(() => {
+    localStorage.setItem("tetris_settings", JSON.stringify(settings));
+  }, [settings]);
+
+  // Offline/Online Fallback
+  useEffect(() => {
+    const handleOnline = () => {
+      console.log("Device is online, triggering sync...");
+      triggerSyncManually();
+    };
+    window.addEventListener("online", handleOnline);
+    return () => window.removeEventListener("online", handleOnline);
+  }, []);
 
   const settingsRef = useRef(settings);
   useEffect(() => { settingsRef.current = settings; }, [settings]);
@@ -405,6 +506,19 @@ export default function Tetris() {
     const { piece, board } = state;
     if (!piece) return;
 
+    // T-Spin Kontrolü (3-Corner Rule)
+    let isTSpin = false;
+    if (piece.color === "T" && state.lastMoveWasRotation) {
+      let corners = 0;
+      const cornerOffsets = [[0,0], [2,0], [0,2], [2,2]];
+      for (const [cx, cy] of cornerOffsets) {
+        const nx = piece.x + cx, ny = piece.y + cy;
+        if (ny < 0 || ny >= ROWS || nx < 0 || nx >= COLS || board[ny][nx]) corners++;
+      }
+      if (corners >= 3) isTSpin = true;
+    }
+
+    // Parçayı tahtaya yerleştir
     for (let r = 0; r < piece.shape.length; r++)
       for (let c = 0; c < piece.shape[r].length; c++)
         if (piece.shape[r][c]) {
@@ -418,20 +532,68 @@ export default function Tetris() {
         }
 
     const cleared = clearLines();
-    const pts = [0, 100, 300, 500, 800][cleared] || 0;
-    state.score += pts * state.level;
+    let baseScore = 0;
+    let msg = "";
+
+    // Guideline Skor Tablosu
+    if (isTSpin) {
+      if (cleared === 0) baseScore = 400;
+      else if (cleared === 1) baseScore = 800;
+      else if (cleared === 2) baseScore = 1200;
+      else if (cleared === 3) baseScore = 1600;
+      msg = cleared > 0 ? `T-SPIN ${["","SINGLE","DOUBLE","TRIPLE"][cleared]}!` : "T-SPIN!";
+    } else {
+      if (cleared === 1) baseScore = 100;
+      else if (cleared === 2) baseScore = 300;
+      else if (cleared === 3) baseScore = 500;
+      else if (cleared === 4) { baseScore = 1200; msg = "TETRIS!"; }
+    }
+
+    // Combo & Back-to-Back Logic
+    if (cleared > 0) {
+      state.comboCount++;
+      if (state.comboCount > 0) {
+        state.score += 50 * state.comboCount * state.level;
+        msg += msg ? ` + COMBO ${state.comboCount}` : `COMBO ${state.comboCount}`;
+      }
+
+      // Difficult moves: Tetris or T-Spin with lines
+      const isDifficult = cleared === 4 || (isTSpin && cleared > 0);
+      if (isDifficult) {
+        if (state.isBackToBack) {
+          baseScore *= 1.5;
+          msg = "B2B " + msg;
+        }
+        state.isBackToBack = true;
+      } else {
+        state.isBackToBack = false;
+      }
+    } else {
+      state.comboCount = -1;
+    }
+
+    state.score += baseScore * state.level;
     state.lines += cleared;
     state.level = Math.floor(state.lines / 10) + 1;
     state.dropInterval = Math.max(80, 800 - (state.level - 1) * 72);
 
-    state.canHold = true; // yeni parçada hold hakkı sıfırlanır
+    if (msg) {
+      setUi(prev => ({ ...prev, message: msg }));
+      setTimeout(() => setUi(prev => ({ ...prev, message: "" })), 2000);
+    }
+
+    state.canHold = true;
+    state.lockTimer = 0;
+    state.lockResets = 0;
+    state.lastMoveWasRotation = false;
     state.piece = { ...state.next, shape: state.next.shape.map(r => [...r]), x: 3, y: 0 };
     state.next = randomPiece(state);
 
     if (collides(board, state.piece)) { state.gameOver = true; state.running = false; }
     
     const newBest = Math.max(ui.bestScore, state.score);
-    setUi({ 
+    setUi(prev => ({ 
+      ...prev,
       score: state.score, 
       lines: state.lines, 
       level: state.level, 
@@ -439,8 +601,109 @@ export default function Tetris() {
       gameOver: state.gameOver, 
       running: state.running,
       paused: false
+    }));
+  }, [clearLines, ui.bestScore, ui.score, ui.level, ui.lines]);
+
+  // ── Aksiyon fonksiyonları ─────────────────────────────────────────────────
+  const btnLeft = useCallback(() => {
+    const s = g.current;
+    if (!s.running || !s.piece || s.paused) return;
+    if (!collides(s.board, s.piece, -1, 0)) { 
+      s.piece.x--; 
+      s.lastMoveWasRotation = false; // Hareket rotasyonu bozar
+      // Reset lock timer if grounded
+      if (collides(s.board, s.piece, 0, 1) && s.lockResets < MAX_LOCK_RESETS) {
+        s.lockTimer = 0;
+        s.lockResets++;
+      }
+      render(); 
+    }
+  }, [render]);
+
+  const btnRight = useCallback(() => {
+    const s = g.current;
+    if (!s.running || !s.piece || s.paused) return;
+    if (!collides(s.board, s.piece, 1, 0)) { 
+      s.piece.x++; 
+      s.lastMoveWasRotation = false;
+      // Reset lock timer if grounded
+      if (collides(s.board, s.piece, 0, 1) && s.lockResets < MAX_LOCK_RESETS) {
+        s.lockTimer = 0;
+        s.lockResets++;
+      }
+      render(); 
+    }
+  }, [render]);
+
+  const btnDown = useCallback(() => {
+    const s = g.current;
+    if (!s.running || !s.piece || s.paused) return;
+    if (!collides(s.board, s.piece, 0, 1)) { 
+      s.piece.y++; 
+      s.score += 1; 
+      s.lockTimer = 0;
+      s.lastMoveWasRotation = false;
+      render(); 
+    } else {
+      s.lockTimer += 100;
+      if (s.lockTimer >= SOFT_LOCK_DELAY) lockPiece();
+    }
+  }, [render, lockPiece]);
+
+  const tryRotate = useCallback(() => {
+    const state = g.current;
+    if (!state.piece) return;
+    const rotated = rotate(state.piece.shape);
+    const offsets = [
+      [0, 0], [1, 0], [-1, 0], [0, -1], [2, 0], [-2, 0], [1, -1], [-1, -1], [0, -2]
+    ];
+    for (const [dx, dy] of offsets) {
+      if (!collides(state.board, state.piece, dx, dy, rotated)) {
+        state.piece.shape = rotated;
+        state.piece.x += dx;
+        state.piece.y += dy;
+        return;
+      }
+    }
+  }, []);
+
+  const btnRotate = useCallback(() => {
+    const s = g.current;
+    if (!s.running || s.paused) return;
+    tryRotate(); 
+    s.lastMoveWasRotation = true; // Rotasyon flagini set et
+    // Reset lock timer if grounded after rotation
+    if (collides(s.board, s.piece, 0, 1) && s.lockResets < MAX_LOCK_RESETS) {
+      s.lockTimer = 0;
+      s.lockResets++;
+    }
+    render();
+  }, [render, tryRotate]);
+
+  const handleInputs = useCallback((delta) => {
+    const s = g.current;
+    if (!s.running || s.paused || !s.piece) return;
+
+    const keys = ["ArrowLeft", "ArrowRight", "ArrowDown"];
+    keys.forEach(key => {
+      const input = s.inputs[key];
+      if (!input || !input.held) return;
+
+      input.timer += delta;
+      const threshold = input.repeating ? REPEAT_INTERVAL : INITIAL_DELAY;
+
+      if (input.timer >= threshold) {
+        input.timer = 0;
+        input.repeating = true;
+        if (key === "ArrowLeft") btnLeft();
+        if (key === "ArrowRight") btnRight();
+        if (key === "ArrowDown") btnDown();
+      }
     });
-  }, [clearLines, ui.bestScore]);
+  }, [btnLeft, btnRight, btnDown]);
+
+
+
 
   // ── Hold ──────────────────────────────────────────────────────────────────
   const btnHold = useCallback(() => {
@@ -463,23 +726,7 @@ export default function Tetris() {
     render();
   }, [render]);
 
-  // ── Döndür ────────────────────────────────────────────────────────────────
-  const tryRotate = useCallback(() => {
-    const state = g.current;
-    if (!state.piece) return;
-    const rotated = rotate(state.piece.shape);
-    const offsets = [
-      [0, 0], [1, 0], [-1, 0], [0, -1], [2, 0], [-2, 0], [1, -1], [-1, -1], [0, -2]
-    ];
-    for (const [dx, dy] of offsets) {
-      if (!collides(state.board, state.piece, dx, dy, rotated)) {
-        state.piece.shape = rotated;
-        state.piece.x += dx;
-        state.piece.y += dy;
-        return;
-      }
-    }
-  }, []);
+
 
   // ── Oyun döngüsü ──────────────────────────────────────────────────────────
   const gameLoop = useCallback((time) => {
@@ -494,15 +741,30 @@ export default function Tetris() {
 
     const delta = Math.min(time - state.lastTime, 200);
     state.lastTime = time;
-    state.accumulated += delta;
-    if (state.accumulated >= state.dropInterval) {
-      state.accumulated = 0;
-      if (!collides(state.board, state.piece, 0, 1)) state.piece.y++;
-      else lockPiece();
+
+    handleInputs(delta);
+
+    const isGrounded = collides(state.board, state.piece, 0, 1);
+
+    if (isGrounded) {
+      // Yere değiyor: Kilitlenme zamanlayıcısını biriktir
+      state.lockTimer += delta;
+      if (state.lockTimer >= LOCK_DELAY) {
+        lockPiece();
+      }
+    } else {
+      // Havada: Normal yerçekimi
+      state.lockTimer = 0;
+      state.accumulated += delta;
+      if (state.accumulated >= state.dropInterval) {
+        state.accumulated = 0;
+        state.piece.y++;
+      }
     }
+
     render();
     rafRef.current = requestAnimationFrame(gameLoop);
-  }, [render, lockPiece]);
+  }, [render, lockPiece, handleInputs]);
 
   // ── Başlat ────────────────────────────────────────────────────────────────
   const startGame = useCallback(() => {
@@ -519,6 +781,8 @@ export default function Tetris() {
     state.paused = false;
     state.dropInterval = 800;
     state.accumulated = 0;
+    state.lockTimer = 0;
+    state.lockResets = 0;
     state.bag = shuffleBag();
     state.bagIndex = 0;
     state.piece = randomPiece(state);
@@ -559,6 +823,7 @@ export default function Tetris() {
   const getRanks = async (score) => {
     if (!supabase) return;
     try {
+      // Kişisel sıralamalar
       const { data: globalRank } = await supabase.rpc('get_rank', { player_score: score });
       const { data: countryRank } = await supabase.rpc('get_rank_country', { player_score: score, country_name: geo.country });
       const { data: cityRank } = await supabase.rpc('get_rank_city', { player_score: score, city_name: geo.city });
@@ -568,6 +833,15 @@ export default function Tetris() {
         country: countryRank || 1,
         city: cityRank || 1
       });
+
+      // Top 10 Listesi
+      const { data: top10 } = await supabase
+        .from('leaderboard')
+        .select('*')
+        .order('score', { ascending: false })
+        .limit(10);
+      
+      if (top10) setLeaderboard(top10);
     } catch (e) { console.error("Sıralama hatası:", e); }
   };
 
@@ -582,8 +856,16 @@ export default function Tetris() {
     }
     
     setIsSubmitting(true);
+    const scoreData = {
+      username,
+      score: ui.bestScore,
+      city: settings.hideLocation ? "Secret" : geo.city,
+      country: settings.hideLocation ? "Global" : geo.country,
+      country_code: settings.hideLocation ? "??" : geo.countryCode
+    };
+
     try {
-      // Önce ismin benzersizliğini kontrol et (basit kontrol)
+      // 1. İsim kontrolü
       const { data: existing } = await supabase.from('leaderboard').select('username').eq('username', username).single();
       if (existing) {
         alert("Bu isim zaten alınmış, lütfen başka bir isim seçin.");
@@ -591,51 +873,36 @@ export default function Tetris() {
         return;
       }
 
-      const { error } = await supabase.from('leaderboard').insert([{
-        username,
-        score: ui.bestScore,
-        city: geo.city,
-        country: geo.country,
-        country_code: geo.countryCode
-      }]);
-
+      // 2. Supabase'e gönder
+      const { error } = await supabase.from('leaderboard').insert([scoreData]);
       if (error) throw error;
       
+      // 3. IndexedDB'ye de yedekle (synced: true olarak)
+      const db = await initDB();
+      const tx = db.transaction("scores", "readwrite");
+      await tx.objectStore("scores").add({ ...scoreData, synced: true, date: new Date().toISOString() });
+
+      // Başarıyla kaydedildi: Nickname'i hatırla
+      localStorage.setItem("tetris_nick", username);
+      setUi(prev => ({ ...prev, savedNickname: username }));
+
       await getRanks(ui.bestScore);
       alert("Skorun kaydedildi!");
     } catch (e) {
-      console.error("Skor kaydedilirken hata:", e);
-      alert("Hata oluştu: " + e.message);
+      console.error("Skor kaydedilirken hata (Offline olabilir):", e);
+      // 4. Hata durumunda offline kaydet
+      await saveScoreOffline(scoreData);
+      alert("Skorun cihazına kaydedildi. Bağlantı geldiğinde otomatik gönderilecek.");
+      
+      // Başarıyla "offline" kaydedildi kabul et
+      localStorage.setItem("tetris_nick", username);
+      setUi(prev => ({ ...prev, savedNickname: username }));
     } finally {
       setIsSubmitting(false);
     }
   };
 
-  // ── Aksiyon fonksiyonları ─────────────────────────────────────────────────
-  const btnLeft = useCallback(() => {
-    const s = g.current;
-    if (!s.running || !s.piece || s.paused) return;
-    if (!collides(s.board, s.piece, -1, 0)) { s.piece.x--; render(); }
-  }, [render]);
 
-  const btnRight = useCallback(() => {
-    const s = g.current;
-    if (!s.running || !s.piece || s.paused) return;
-    if (!collides(s.board, s.piece, 1, 0)) { s.piece.x++; render(); }
-  }, [render]);
-
-  const btnDown = useCallback(() => {
-    const s = g.current;
-    if (!s.running || !s.piece || s.paused) return;
-    if (!collides(s.board, s.piece, 0, 1)) { s.piece.y++; s.score += 1; render(); }
-    else lockPiece();
-  }, [render, lockPiece]);
-
-  const btnRotate = useCallback(() => {
-    const s = g.current;
-    if (!s.running || s.paused) return;
-    tryRotate(); render();
-  }, [render, tryRotate]);
 
   const btnHardDrop = useCallback(() => {
     const s = g.current;
@@ -649,23 +916,53 @@ export default function Tetris() {
 
   // ── Klavye ────────────────────────────────────────────────────────────────
   useEffect(() => {
-    const handleKey = (e) => {
+    const handleKeyDown = (e) => {
       const state = g.current;
-      if (!state.running || !state.piece) return;
+      if (!state.running || !state.piece || state.paused) return;
+
+      // DAS/ARR keys (Only initialize timer on first press)
+      if (["ArrowLeft", "ArrowRight", "ArrowDown"].includes(e.key)) {
+        e.preventDefault();
+        if (!state.inputs[e.key] || !state.inputs[e.key].held) {
+          state.inputs[e.key] = { held: true, timer: 0, repeating: false };
+          if (e.key === "ArrowLeft") btnLeft();
+          if (e.key === "ArrowRight") btnRight();
+          if (e.key === "ArrowDown") {
+             // Down key repeats faster than standard DAS? 
+             // Standard Tetris: Soft drop is often instant ARR
+             btnDown();
+          }
+        }
+        return;
+      }
+
+      // Single-fire keys
       switch (e.key) {
-        case "ArrowLeft":  btnLeft();    break;
-        case "ArrowRight": btnRight();   break;
-        case "ArrowDown":  btnDown();    break;
-        case "ArrowUp": case "x": case "X": btnRotate(); break;
+        case "ArrowUp": case "x": case "X": 
+          e.preventDefault(); 
+          btnRotate(); 
+          break;
         case " ": e.preventDefault(); btnHardDrop(); break;
         case "c": case "C": case "Shift": e.preventDefault(); btnHold(); break;
         case "p": case "P": case "Escape": e.preventDefault(); togglePause(); break;
-        default: return;
+        default: break;
       }
     };
-    window.addEventListener("keydown", handleKey);
-    return () => window.removeEventListener("keydown", handleKey);
-  }, [btnLeft, btnRight, btnDown, btnRotate, btnHardDrop, btnHold]);
+
+    const handleKeyUp = (e) => {
+      const state = g.current;
+      if (state.inputs[e.key]) {
+        state.inputs[e.key].held = false;
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+    };
+  }, [btnLeft, btnRight, btnDown, btnRotate, btnHardDrop, btnHold, togglePause]);
 
   useEffect(() => () => cancelAnimationFrame(rafRef.current), []);
 
@@ -702,16 +999,133 @@ export default function Tetris() {
   return (
     <div style={{
       display: "flex", flexDirection: "column", alignItems: "center",
-      justifyContent: "flex-start", minHeight: "100vh",
+      justifyContent: "flex-start", minHeight: "100dvh", 
+      width: "100%",
       background: "radial-gradient(ellipse at 50% 0%, #0d0d2b 0%, #040408 70%)",
       fontFamily: "'Press Start 2P', monospace", color: "#fff",
       userSelect: "none", touchAction: "none",
-      paddingTop: "0.8rem", paddingBottom: "2rem",
+      paddingTop: "max(0.8rem, env(safe-area-inset-top))", 
+      paddingBottom: "max(2rem, env(safe-area-inset-bottom))",
+      overscrollBehavior: "none",
+      overflow: "hidden",
     }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
         * { box-sizing: border-box; margin: 0; padding: 0; }
         button { cursor: pointer; font-family: inherit; }
+        
+        .game-layout {
+          display: flex;
+          gap: 2rem;
+          align-items: flex-start;
+          transition: all 0.3s ease;
+          position: relative;
+        }
+
+        .side-panel {
+          display: flex;
+          flex-direction: column;
+          gap: 1.5rem;
+          width: 150px;
+        }
+
+        .board-canvas {
+          display: block;
+          border: 2px solid rgba(0,245,255,0.3);
+          box-shadow: 0 0 45px rgba(0,245,255,0.15);
+          max-width: 100%;
+          max-height: 75vh;
+          width: auto;
+          height: auto;
+          background: rgba(0,0,0,0.6);
+        }
+
+        @media (max-width: 768px) {
+          .game-layout {
+            flex-direction: column;
+            align-items: center;
+            gap: 0;
+            width: 100vw;
+            padding: 0;
+            margin-top: -1.2rem;
+          }
+          .board-canvas {
+            max-height: 52vh !important;
+            max-width: 82vw !important;
+            border: 1px solid rgba(0,245,255,0.4);
+            box-shadow: 0 0 50px rgba(0,245,255,0.15);
+            border-radius: 6px;
+          }
+          .side-panel {
+            display: none !important;
+          }
+          
+          .mobile-overlay-panel {
+            position: absolute;
+            background: rgba(0,0,0,0.8);
+            backdrop-filter: blur(15px);
+            border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 4px;
+            padding: 0.2rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            z-index: 10;
+          }
+          
+          .mobile-hold { top: 0.2rem; left: 0.2rem; border-color: rgba(255,215,0,0.4); }
+          .mobile-next { top: 0.2rem; right: 0.2rem; border-color: rgba(191,0,255,0.4); }
+          
+          h1 {
+            font-size: 0.7rem !important;
+            margin-bottom: 0.8rem !important;
+            letter-spacing: 0.4em !important;
+            opacity: 0.7;
+          }
+          
+          .stats-bar {
+            display: flex;
+            justify-content: space-between;
+            width: 78vw;
+            background: rgba(0,0,0,0.6);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-top: none;
+            border-radius: 0 0 16px 16px;
+            padding: 0.4rem 1.2rem;
+            margin-bottom: 1rem;
+          }
+          
+          .control-deck {
+            flex: 1;
+            width: 100%;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.5rem 1.5rem calc(0.5rem + env(safe-area-inset-bottom)) 1.5rem;
+            background: rgba(0,0,0,0.25);
+            backdrop-filter: blur(8px);
+          }
+
+          .m-btn {
+            border-radius: 50% !important;
+            background: rgba(255,255,255,0.03) !important;
+            border: 2px solid rgba(255,255,255,0.15) !important;
+            transition: all 0.08s ease-out;
+            display: flex !important;
+            align-items: center;
+            justify-content: center;
+            box-shadow: inset 0 0 20px rgba(0,0,0,0.5);
+            -webkit-user-select: none;
+            -webkit-tap-highlight-color: transparent;
+          }
+          
+          .m-btn:active {
+            transform: scale(0.9);
+            background: rgba(255,255,255,0.1) !important;
+            border-color: currentColor !important;
+            box-shadow: inset 0 0 10px rgba(0,0,0,0.8), 0 0 20px currentColor;
+          }
+        }
       `}</style>
 
       {ui.paused && (
@@ -723,48 +1137,106 @@ export default function Tetris() {
         <h1 style={{ fontSize: "clamp(1rem, 3vw, 1.5rem)", letterSpacing: "0.35em", color: "#00f5ff", textShadow: "0 0 24px #00f5ff, 0 0 50px #00f5ff44" }}>
           TETRIS
         </h1>
+
+        {isTouch && ui.running && !ui.gameOver && (
+          <button
+            onClick={togglePause}
+            style={{
+              background: "rgba(0,245,255,0.1)",
+              border: "2px solid rgba(0,245,255,0.4)",
+              color: "#00f5ff",
+              width: 42,
+              height: 42,
+              borderRadius: 12,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontSize: "1.1rem",
+              boxShadow: "0 0 15px rgba(0,245,255,0.15)",
+              backdropFilter: "blur(10px)",
+              transition: "all 0.1s ease",
+              cursor: "pointer"
+            }}
+          >
+            {ui.paused ? "▶" : "II"}
+          </button>
+        )}
       </div>
 
       {/* Oyun alanı */}
-      <div style={{ display: "flex", gap: "1.5rem", alignItems: "flex-start" }}>
+      <div className="game-layout">
 
-        {/* Sol panel: HOLD */}
-        <div style={{ display: "flex", flexDirection: "column", gap: "1.1rem", width: PW }}>
-          <div>
-            <p style={{ fontSize: "0.7rem", color: "#444", marginBottom: "0.5rem", letterSpacing: "0.15em" }}>HOLD</p>
-            <canvas ref={holdCanvasRef} width={PW} height={PH}
-              style={{ display: "block", border: "1px solid rgba(255,255,255,0.06)" }} />
-            <p style={{ fontSize: "0.55rem", color: "#2a2a3a", marginTop: "0.5rem", marginBottom: "1.5rem", lineHeight: 1.8 }}>
-              C / Shift<br />mobil: HOLD
-            </p>
+        {/* Sol panel: HOLD (Masaüstü) */}
+        {!isTouch && (
+          <div className="side-panel">
+            <div>
+              <p style={{ fontSize: "0.7rem", color: "#444", marginBottom: "0.5rem", letterSpacing: "0.15em" }}>HOLD</p>
+              <canvas ref={holdCanvasRef} width={PW} height={PH}
+                style={{ display: "block", border: "1px solid rgba(255,255,255,0.06)", width: "100%", height: "auto" }} />
+              <p className="keys-hint" style={{ fontSize: "0.55rem", color: "#2a2a3a", marginTop: "0.5rem", marginBottom: "1.5rem", lineHeight: 1.8 }}>
+                C / Shift<br />mobil: HOLD
+              </p>
 
-            {ui.running && !ui.gameOver && (
-              <button
-                onClick={togglePause}
-                style={{
-                  background: "transparent", border: "1px solid #2a2a3a", color: "#00f5ff",
-                  width: 48, height: 48, borderRadius: 8, fontSize: "1.1rem",
-                  display: "flex", alignItems: "center", justifyContent: "center",
-                  boxShadow: "0 0 15px rgba(0,245,255,0.1)", margin: "0 auto"
-                }}
-                onPointerEnter={e => { e.currentTarget.style.borderColor = "#00f5ff88"; e.currentTarget.style.background = "#00f5ff11"; }}
-                onPointerLeave={e => { e.currentTarget.style.borderColor = "#2a2a3a"; e.currentTarget.style.background = "transparent"; }}
-              >
-                {ui.paused ? "▶" : "II"}
-              </button>
-            )}
+              {ui.running && !ui.gameOver && (
+                <button
+                  onClick={togglePause}
+                  style={{
+                    background: "transparent", border: "1px solid #2a2a3a", color: "#00f5ff",
+                    width: 48, height: 48, borderRadius: 8, fontSize: "1.1rem",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    boxShadow: "0 0 15px rgba(0,245,255,0.1)", margin: "0 auto"
+                  }}
+                  onPointerEnter={e => { e.currentTarget.style.borderColor = "#00f5ff88"; e.currentTarget.style.background = "#00f5ff11"; }}
+                  onPointerLeave={e => { e.currentTarget.style.borderColor = "#2a2a3a"; e.currentTarget.style.background = "transparent"; }}
+                >
+                  {ui.paused ? "▶" : "II"}
+                </button>
+              )}
+            </div>
           </div>
-        </div>
+        )}
 
         {/* Board */}
         <div style={{ position: "relative" }}>
           <canvas
             ref={canvasRef}
             width={COLS * CELL} height={ROWS * CELL}
-            style={{ display: "block", border: "2px solid rgba(0,245,255,0.3)", boxShadow: "0 0 35px rgba(0,245,255,0.1)" }}
+            className="board-canvas"
             onTouchStart={handleTouchStart}
             onTouchEnd={handleTouchEnd}
           />
+          
+          {/* Mobil Overlays (Sadece mobilde görünür) */}
+          {isTouch && (
+            <>
+              <div className="mobile-overlay-panel mobile-hold">
+                <span style={{ fontSize: "0.4rem", color: "#555", marginBottom: "0.2rem" }}>HOLD</span>
+                <canvas ref={holdCanvasRef} width={PW} height={PH} style={{ width: 45, height: 35 }} />
+              </div>
+              <div className="mobile-overlay-panel mobile-next">
+                <span style={{ fontSize: "0.4rem", color: "#555", marginBottom: "0.2rem" }}>NEXT</span>
+                <canvas ref={nextCanvasRef} width={PW} height={PH} style={{ width: 45, height: 35 }} />
+              </div>
+            </>
+          )}
+
+          {ui.message && (
+            <div 
+              key={ui.message}
+              style={{
+                position: "absolute", top: "45%", left: "50%",
+                transform: "translate(-50%, -50%)",
+                zIndex: 60, pointerEvents: "none",
+                animation: "floatUp 1.2s ease-out forwards",
+                color: "#00f5ff", fontSize: "0.8rem", fontWeight: "bold",
+                textShadow: "0 0 15px #00f5ff, 0 0 30px #00f5ff",
+                letterSpacing: "0.15em", textAlign: "center", width: "100%",
+                fontFamily: "inherit"
+              }}
+            >
+              {ui.message}
+            </div>
+          )}
           {!ui.running && (
             <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "rgba(4,4,12,0.95)", gap: "1.1rem", zIndex: 50, padding: "2rem" }}>
               {ui.gameOver && (
@@ -776,7 +1248,7 @@ export default function Tetris() {
                   </div>
                   
                   {/* Skor Kaydetme Bölümü */}
-                  <div style={{ borderTop: "1px solid #222", paddingTop: "1.5rem", width: "100%", maxWidth: 260 }}>
+                  <div style={{ borderTop: "1px solid #222", paddingTop: "1.5rem", width: "100%", maxWidth: 280 }}>
                     <p style={{ fontSize: "0.4rem", color: "#555", marginBottom: "0.8rem", textAlign: "center" }}>LİDERLİK TABLOSUNA KATIL</p>
                     {userRank.global === 0 ? (
                       <div style={{ display: "flex", flexDirection: "column", gap: "0.8rem" }}>
@@ -784,6 +1256,7 @@ export default function Tetris() {
                           id="nickname-input"
                           type="text"
                           placeholder="Unique Nickname"
+                          defaultValue={ui.savedNickname}
                           maxLength={15}
                           style={{
                             background: "#0a0a15", border: "1px solid #333", color: "#fff",
@@ -801,10 +1274,37 @@ export default function Tetris() {
                       </div>
                     ) : (
                       <div style={{ textAlign: "center" }}>
-                        <p style={{ fontSize: "0.45rem", color: "#39ff14", marginBottom: "0.8rem" }}>SIRALAMALARIN</p>
-                        <p style={{ fontSize: "0.38rem", color: "#ccc", margin: "0.4rem 0" }}>DÜNYA: #{userRank.global}</p>
-                        <p style={{ fontSize: "0.38rem", color: "#ccc", margin: "0.4rem 0" }}>{geo.country.toUpperCase()}: #{userRank.country}</p>
-                        <p style={{ fontSize: "0.38rem", color: "#ccc", margin: "0.4rem 0" }}>{geo.city.toUpperCase()}: #{userRank.city}</p>
+                        <p style={{ fontSize: "0.45rem", color: "#39ff14", marginBottom: "1rem" }}>SIRALAMALARIN</p>
+                        <div style={{ fontSize: "0.35rem", color: "#ccc", display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+                          <p>DÜNYA : #{userRank.global}</p>
+                          {!geo.country ? (
+                            <p style={{ color: "#555" }}>KONUM YÜKLENİYOR...</p>
+                          ) : (
+                            <>
+                              <p>{getFlagEmoji(geo.countryCode)} {geo.country.toUpperCase()} : #{userRank.country}</p>
+                              <p>📍 {geo.city.toUpperCase()} : #{userRank.city}</p>
+                            </>
+                          )}
+                        </div>
+
+                        {/* Top 10 Listesi */}
+                        {leaderboard.length > 0 && (
+                          <div style={{ marginTop: "1.5rem", borderTop: "1px solid #222", paddingTop: "1.5rem" }}>
+                            <p style={{ fontSize: "0.4rem", color: "#ffd700", marginBottom: "1rem" }}>TOP 10 DÜNYA LİDERLERİ</p>
+                            <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem", textAlign: "left" }}>
+                              {leaderboard.map((entry, i) => (
+                                <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "0.3rem", padding: "0.2rem 0", borderBottom: "1px solid #111" }}>
+                                  <div style={{ display: "flex", gap: "0.4rem", alignItems: "center" }}>
+                                    <span style={{ color: "#555", width: 25 }}>{i+1}.</span>
+                                    <span style={{ color: i === 0 ? "#ffd700" : "#fff" }}>{entry.username.toUpperCase()}</span>
+                                    <span>{getFlagEmoji(entry.country_code)}</span>
+                                  </div>
+                                  <span style={{ color: "#00f5ff" }}>{entry.score}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
@@ -820,71 +1320,106 @@ export default function Tetris() {
           )}
         </div>
 
-        {/* Sağ panel: NEXT + skor */}
-        <div style={{ display: "flex", flexDirection: "column", gap: "1.1rem", width: PW }}>
-          <div>
-            <p style={{ fontSize: "0.7rem", color: "#444", marginBottom: "0.5rem", letterSpacing: "0.15em" }}>NEXT</p>
-            <canvas ref={nextCanvasRef} width={PW} height={PH}
-              style={{ display: "block", border: "1px solid rgba(255,255,255,0.06)" }} />
+        {/* Sağ panel: NEXT + skor (Masaüstü) */}
+        {!isTouch && (
+          <div className="side-panel">
+            <div>
+              <p style={{ fontSize: "0.7rem", color: "#444", marginBottom: "0.5rem", letterSpacing: "0.15em" }}>NEXT</p>
+              <canvas ref={nextCanvasRef} width={PW} height={PH}
+                style={{ display: "block", border: "1px solid rgba(255,255,255,0.06)", width: "100%", height: "auto" }} />
+            </div>
+            {[
+              { label: "BEST", value: ui.bestScore, color: "#00f5ff" },
+              { label: "SCORE", value: ui.score, color: "#ffd700" },
+              { label: "LINES", value: ui.lines, color: "#39ff14" },
+              { label: "LEVEL", value: ui.level, color: "#bf00ff" },
+            ].map(({ label, value, color }) => (
+              <div key={label} className="keys-hint" style={{ display: 'flex', flexDirection: 'column' }}>
+                <p style={{ fontSize: "0.6rem", color: "#3a3a4a", marginBottom: "0.3rem", letterSpacing: "0.1em" }}>{label}</p>
+                <p style={{ fontSize: "1rem", color, textShadow: `0 0 10px ${color}` }}>{value}</p>
+              </div>
+            ))}
+            <div className="keys-hint" style={{ fontSize: "0.55rem", color: "#252535", lineHeight: 2.3, marginTop: "0.5rem" }}>
+              <p style={{ color: "#2e2e44", marginBottom: "0.4rem", fontSize: "0.6rem" }}>KEYS</p>
+              <p>← → Hareket</p>
+              <p>↑/X Döndür</p>
+              <p>↓ Soft drop</p>
+              <p>SPC Hard drop</p>
+              <p>C/⇧ Hold</p>
+            </div>
           </div>
+        )}
+      </div>
+
+      {/* Stats Bar (Sadece mobilde board altında görünür) */}
+      {isTouch && (
+        <div className="stats-bar">
           {[
-            { label: "BEST", value: ui.bestScore, color: "#00f5ff" },
             { label: "SCORE", value: ui.score, color: "#ffd700" },
             { label: "LINES", value: ui.lines, color: "#39ff14" },
             { label: "LEVEL", value: ui.level, color: "#bf00ff" },
-          ].map(({ label, value, color }) => (
-            <div key={label}>
-              <p style={{ fontSize: "0.6rem", color: "#3a3a4a", marginBottom: "0.3rem", letterSpacing: "0.1em" }}>{label}</p>
-              <p style={{ fontSize: "1rem", color, textShadow: `0 0 10px ${color}` }}>{value}</p>
+          ].map(s => (
+            <div key={s.label} style={{ textAlign: "center" }}>
+              <p style={{ fontSize: "0.3rem", color: "#555", marginBottom: "0.1rem" }}>{s.label}</p>
+              <p style={{ fontSize: "0.6rem", color: s.color, fontWeight: "bold" }}>{s.value}</p>
             </div>
           ))}
-          <div style={{ fontSize: "0.55rem", color: "#252535", lineHeight: 2.3, marginTop: "0.5rem" }}>
-            <p style={{ color: "#2e2e44", marginBottom: "0.4rem", fontSize: "0.6rem" }}>KEYS</p>
-            <p>← → Hareket</p>
-            <p>↑/X Döndür</p>
-            <p>↓ Soft drop</p>
-            <p>SPC Hard drop</p>
-            <p>C/⇧ Hold</p>
-          </div>
         </div>
-      </div>
+      )}
 
-      {/* ── Mobil Butonlar ─────────────────────────────────────────── */}
+      {/* ── Mobil Butonlar (Pro Elite Style) ─────────────────────────────────────────── */}
       {isTouch && settings.showButtons && (
-        <div style={{
-          marginTop: "1.2rem",
-          display: "flex",
-          alignItems: "flex-end",
-          justifyContent: "center",
-          gap: "1rem",
-          width: "100%",
-          maxWidth: 560,
-          padding: "0 0.5rem",
-        }}>
-          {/* Sol grup: HOLD üstte, ← ↓ → altta */}
-          <div style={{ display: "flex", flexDirection: "column", gap: "0.45rem" }}>
-            {/* Üst: HOLD sol, boş sağ */}
-            <div style={{ display: "flex", gap: "0.45rem" }}>
-              <MobileBtn
-                label="HOLD"
-                onAction={btnHold}
-                color="#ffd700"
-                style={{ width: 72, height: 58, fontSize: "0.55rem", fontFamily: "'Press Start 2P', monospace", letterSpacing: "0.05em" }}
-              />
-              <div style={{ width: 72 }} />
-            </div>
-            {/* Alt: ← ↓ → */}
-            <div style={{ display: "flex", gap: "0.45rem" }}>
-              <MobileBtn label="◀" onAction={btnLeft}  repeat color="#00f5ff" style={{ width: 72, height: 64, fontSize: "1.3rem" }} />
-              <MobileBtn label="▼" onAction={btnDown}  repeat color="#39ff14" style={{ width: 72, height: 64, fontSize: "1.3rem" }} />
-              <MobileBtn label="▶" onAction={btnRight} repeat color="#00f5ff" style={{ width: 72, height: 64, fontSize: "1.3rem" }} />
-            </div>
+        <div className="control-deck">
+          {/* Sol: Hareket (D-Pad Style) */}
+          <div style={{ position: "relative", width: 150, height: 150 }}>
+             <div style={{ position: "absolute", left: 0, top: 44 }}>
+                <MobileBtn label="◀" onAction={btnLeft} repeat color="#00f5ff" style={{ width: 60, height: 60, fontSize: "1.3rem !important" }} />
+             </div>
+             <div style={{ position: "absolute", right: 0, top: 44 }}>
+                <MobileBtn label="▶" onAction={btnRight} repeat color="#00f5ff" style={{ width: 60, height: 60, fontSize: "1.3rem !important" }} />
+             </div>
+             <div style={{ position: "absolute", left: 45, bottom: 0 }}>
+                <MobileBtn label="▼" onAction={btnDown} repeat color="#39ff14" style={{ width: 60, height: 60, fontSize: "1.3rem !important" }} />
+             </div>
           </div>
 
-          {/* Sağ grup: Döndür + Hard Drop */}
-          <div style={{ display: "flex", flexDirection: "column", gap: "0.45rem", alignItems: "center" }}>
-            <MobileBtn label="↺"   onAction={btnRotate}   color="#bf00ff" style={{ width: 76, height: 58, fontSize: "1.5rem" }} />
-            <MobileBtn label="DROP" onAction={btnHardDrop} color="#ff2052" style={{ width: 110, height: 64, fontSize: "0.6rem", fontFamily: "'Press Start 2P', monospace", letterSpacing: "0.05em" }} />
+          {/* Sağ: Aksiyon (Pro Cluster) */}
+          <div style={{ position: "relative", width: 160, height: 160 }}>
+             {/* Rotate (Primary) */}
+             <div style={{ position: "absolute", right: 0, top: 0 }}>
+               <MobileBtn 
+                 label="↻" 
+                 onAction={btnRotate} 
+                 color="#bf00ff" 
+                 style={{ 
+                   width: 85, height: 85, 
+                   fontSize: "1.8rem !important",
+                   borderWidth: "3px !important"
+                 }} 
+               />
+             </div>
+             {/* Hold (Top Left of Action Cluster) */}
+             <div style={{ position: "absolute", left: 0, top: 0 }}>
+                <MobileBtn label="H" onAction={btnHold} color="#ffd700" 
+                  style={{ 
+                    width: 54, height: 54, 
+                    fontSize: "0.8rem !important",
+                    borderStyle: "dashed !important",
+                    opacity: 0.8
+                  }} />
+             </div>
+             {/* Hard Drop (Bottom right of Action Cluster) */}
+             <div style={{ position: "absolute", right: 10, bottom: 0 }}>
+               <MobileBtn 
+                 label="↡" 
+                 onAction={btnHardDrop} 
+                 color="#ff2052" 
+                 style={{ 
+                   width: 54, height: 54,
+                   fontSize: "1.3rem !important"
+                 }} 
+               />
+             </div>
           </div>
         </div>
       )}
