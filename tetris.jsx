@@ -25,7 +25,22 @@ const saveScoreOffline = async (scoreData) => {
     const db = await initDB();
     const transaction = db.transaction("scores", "readwrite");
     const store = transaction.objectStore("scores");
-    await store.add({ ...scoreData, synced: false, date: new Date().toISOString() });
+    
+    // Aynı isim ve skorun zaten bekleyenler listesinde olup olmadığını kontrol et
+    const existingScores = await new Promise((resolve) => {
+      const req = store.getAll();
+      req.onsuccess = () => resolve(req.result);
+    });
+
+    const isDuplicate = existingScores.some(s => 
+      s.username === scoreData.username && 
+      s.score === scoreData.score && 
+      !s.synced
+    );
+
+    if (!isDuplicate) {
+      await store.add({ ...scoreData, synced: false, date: new Date().toISOString() });
+    }
     
     // Background Sync Registration
     if ("serviceWorker" in navigator && "SyncManager" in window) {
@@ -76,6 +91,22 @@ const PIECES = {
   Z: { shape: [[1,1,0],[0,1,1]], color: "Z" },
   J: { shape: [[1,0,0],[1,1,1]], color: "J" },
   L: { shape: [[0,0,1],[1,1,1]], color: "L" },
+};
+
+// Gerçek Tetris Hız Tablosu (NES 60Hz Kare Hızları)
+// Seviye 1 (NES 0) -> Level 29+ (Kill Screen)
+const SPEED_TABLE = [
+  800, 717, 633, 550, 467, 383, 300, 217, 133, 100, // Level 1-10
+  83,  83,  83,                                     // Level 11-13
+  67,  67,  67,                                     // Level 14-16
+  50,  50,  50,                                     // Level 17-19
+  33, 33, 33, 33, 33, 33, 33, 33, 33, 33,           // Level 20-29
+  17                                                // Level 30+ (Kill Screen)
+];
+
+const getDropInterval = (level) => {
+  const index = Math.max(0, level - 1);
+  return index >= SPEED_TABLE.length ? SPEED_TABLE[SPEED_TABLE.length - 1] : SPEED_TABLE[index];
 };
 
 // ─── Yardımcılar ──────────────────────────────────────────────────────────────
@@ -575,7 +606,7 @@ export default function Tetris() {
     state.score += baseScore * state.level;
     state.lines += cleared;
     state.level = Math.floor(state.lines / 10) + 1;
-    state.dropInterval = Math.max(80, 800 - (state.level - 1) * 72);
+    state.dropInterval = getDropInterval(state.level);
 
     if (msg) {
       setUi(prev => ({ ...prev, message: msg }));
@@ -779,7 +810,7 @@ export default function Tetris() {
     state.gameOver = false;
     state.running = true;
     state.paused = false;
-    state.dropInterval = 800;
+    state.dropInterval = getDropInterval(1);
     state.accumulated = 0;
     state.lockTimer = 0;
     state.lockResets = 0;
@@ -845,7 +876,7 @@ export default function Tetris() {
     } catch (e) { console.error("Sıralama hatası:", e); }
   };
 
-  const submitScore = async (username) => {
+  const submitScore = async (username, score) => {
     if (!supabase) {
       alert("Liderlik tablosu henüz yapılandırılmamış (.env dosyasını kontrol edin).");
       return;
@@ -858,7 +889,7 @@ export default function Tetris() {
     setIsSubmitting(true);
     const scoreData = {
       username,
-      score: ui.bestScore,
+      score: score,
       city: settings.hideLocation ? "Secret" : geo.city,
       country: settings.hideLocation ? "Global" : geo.country,
       country_code: settings.hideLocation ? "??" : geo.countryCode
@@ -866,16 +897,39 @@ export default function Tetris() {
 
     try {
       // 1. İsim kontrolü
-      const { data: existing } = await supabase.from('leaderboard').select('username').eq('username', username).single();
-      if (existing) {
-        alert("Bu isim zaten alınmış, lütfen başka bir isim seçin.");
-        setIsSubmitting(false);
-        return;
-      }
+      const { data: existing, error: checkError } = await supabase
+        .from('leaderboard')
+        .select('*')
+        .eq('username', username)
+        .maybeSingle();
 
-      // 2. Supabase'e gönder
-      const { error } = await supabase.from('leaderboard').insert([scoreData]);
-      if (error) throw error;
+      if (checkError) throw checkError;
+
+      if (existing) {
+        // Eğer isim varsa, skoru güncelle (sadece yenisi daha yüksekse)
+        if (score > existing.score) {
+          const { error: updateError } = await supabase
+            .from('leaderboard')
+            .update({ 
+              score: score,
+              city: scoreData.city,
+              country: scoreData.country,
+              country_code: scoreData.country_code
+            })
+            .eq('username', username);
+          
+          if (updateError) throw updateError;
+        } else {
+          alert("Bu isimle zaten daha yüksek veya eşit bir skorun var!");
+          setIsSubmitting(false);
+          await getRanks(score);
+          return;
+        }
+      } else {
+        // 2. Yeni isim ise Supabase'e ekle
+        const { error: insertError } = await supabase.from('leaderboard').insert([scoreData]);
+        if (insertError) throw insertError;
+      }
       
       // 3. IndexedDB'ye de yedekle (synced: true olarak)
       const db = await initDB();
@@ -886,7 +940,7 @@ export default function Tetris() {
       localStorage.setItem("tetris_nick", username);
       setUi(prev => ({ ...prev, savedNickname: username }));
 
-      await getRanks(ui.bestScore);
+      await getRanks(score);
       alert("Skorun kaydedildi!");
     } catch (e) {
       console.error("Skor kaydedilirken hata (Offline olabilir):", e);
@@ -894,7 +948,6 @@ export default function Tetris() {
       await saveScoreOffline(scoreData);
       alert("Skorun cihazına kaydedildi. Bağlantı geldiğinde otomatik gönderilecek.");
       
-      // Başarıyla "offline" kaydedildi kabul et
       localStorage.setItem("tetris_nick", username);
       setUi(prev => ({ ...prev, savedNickname: username }));
     } finally {
@@ -1266,7 +1319,7 @@ export default function Tetris() {
                         />
                         <button
                           disabled={isSubmitting}
-                          onClick={() => submitScore(document.getElementById('nickname-input')?.value)}
+                          onClick={() => submitScore(document.getElementById('nickname-input')?.value, ui.score)}
                           style={{ background: "#00f5ff", color: "#000", border: "none", padding: "0.8rem", fontSize: "0.42rem", opacity: isSubmitting ? 0.5 : 1 }}
                         >
                           {isSubmitting ? "KAYDEDİLİYOR..." : "SKORU GÖNDER"}
