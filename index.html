@@ -30,8 +30,24 @@
         window.addEventListener("load", () => {
           navigator.serviceWorker
             .register("/service-worker.js")
-            .then((reg) => console.log("SW Registered:", reg.scope))
+            .then((reg) => {
+              console.log("SW Registered:", reg.scope);
+              
+              // Periyodik kontrol (isteğe bağlı, örn. her 1 saatte bir)
+              setInterval(() => {
+                reg.update();
+              }, 60 * 60 * 1000);
+            })
             .catch((err) => console.error("SW Registration failed:", err));
+        });
+
+        // Yeni bir Service Worker aktif olduğunda sayfayı yenile
+        let refreshing = false;
+        navigator.serviceWorker.addEventListener("controllerchange", () => {
+          if (!refreshing) {
+            refreshing = true;
+            window.location.reload();
+          }
         });
       }
     </script>
