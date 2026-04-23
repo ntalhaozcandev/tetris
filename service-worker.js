@@ -1,7 +1,6 @@
-const CACHE_NAME = "tetris-cache-v2";
+const CACHE_NAME = "tetris-cache-v3";
 const ASSETS_TO_CACHE = [
   "./",
-  "./index.html",
   "./manifest.json",
   "./icon-192.png",
   "./icon-512.png"
@@ -72,11 +71,42 @@ self.addEventListener("activate", (event) => {
   self.clients.claim();
 });
 
-// Fetch Event - Cache First
+// Fetch Event
 self.addEventListener("fetch", (event) => {
+  // Non-GET istekleri cache'e sokma
+  if (event.request.method !== "GET") return;
+
+  const requestUrl = new URL(event.request.url);
+
+  // HTML dokümanlarda her zaman ağı tercih et; offline olursa cache'e düş.
+  if (event.request.mode === "navigate" || requestUrl.pathname.endsWith(".html")) {
+    event.respondWith(
+      fetch(event.request)
+        .then((response) => {
+          const copy = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+          return response;
+        })
+        .catch(() => caches.match(event.request).then((cached) => cached || caches.match("./")))
+    );
+    return;
+  }
+
+  // Harici origin çağrılarında (geo api vb.) cache'e yazma.
+  if (requestUrl.origin !== self.location.origin) {
+    event.respondWith(fetch(event.request));
+    return;
+  }
+
+  // Statik varlıklarda cache-first
   event.respondWith(
     caches.match(event.request).then((response) => {
-      return response || fetch(event.request);
+      if (response) return response;
+      return fetch(event.request).then((networkResponse) => {
+        const copy = networkResponse.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+        return networkResponse;
+      });
     })
   );
 });
