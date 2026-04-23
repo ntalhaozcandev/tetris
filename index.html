@@ -7,7 +7,9 @@
     
     <!-- PWA & Mobile Meta -->
     <link rel="manifest" href="./manifest.json" />
+    <link rel="icon" type="image/png" href="./icon-192.png" />
     <meta name="theme-color" content="#00f5ff" />
+    <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="Tetris" />
@@ -29,7 +31,7 @@
       if ("serviceWorker" in navigator) {
         window.addEventListener("load", () => {
           navigator.serviceWorker
-            .register("/service-worker.js")
+            .register("./service-worker.js")
             .then((reg) => {
               console.log("SW Registered:", reg.scope);
               
@@ -51,7 +53,7 @@
         });
       }
     </script>
-    <script type="module" crossorigin src="./assets/index-BSoDo3mk.js"></script>
+    <script type="module" crossorigin src="./assets/index-DspzNA0O.js"></script>
   </head>
   <body>
     <div id="root"></div>
