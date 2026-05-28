@@ -36,3 +36,13 @@ jobs:
           source: "dist/*"
           target: ~/projects/tetris/dist
           strip_components: 1
+
+      - name: Restart nginx
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: deploy
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            cd ~/projects/tetris
+            docker compose restart
