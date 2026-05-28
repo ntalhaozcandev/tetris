@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { supabase } from "./src/supabase";
+import { useDuel } from "./src/useDuel";
 
 // ── PWA & Offline Config ───────────────────────────────────────────────────
 const SCORE_API_URL = "https://YOUR_API_ENDPOINT/scores";
@@ -76,8 +77,8 @@ const COLORS = {
 };
 
 // Hareket Hızı Ayarları (DAS/ARR) - Pro Level
-const INITIAL_DELAY = 120; // İlk hareketten sonraki bekleme (ms)
-const REPEAT_INTERVAL = 25; // Sürekli hareket hızı (ms)
+const INITIAL_DELAY = 180; // İlk hareketten sonraki bekleme (ms)
+const REPEAT_INTERVAL = 55; // Sürekli hareket hızı (ms)
 const SWIPE_THRESHOLD = 14; // Hücre başına swipe mesafesi (px)
 const LOCK_DELAY = 500;     // Yere değince kilitlenme süresi (ms)
 const SOFT_LOCK_DELAY = 250; // Down tuşu ile kilitlenme süresi (ms)
@@ -104,10 +105,35 @@ const SPEED_TABLE = [
   17                                                // Level 30+ (Kill Screen)
 ];
 
+const SURVIVAL_SHADOW_SCORE_STEP = 900;
+const SURVIVAL_MAX_SHADOW_ROWS = 8;
+
 const getDropInterval = (level) => {
   const index = Math.max(0, level - 1);
   return index >= SPEED_TABLE.length ? SPEED_TABLE[SPEED_TABLE.length - 1] : SPEED_TABLE[index];
 };
+
+const getShadowRows = (score, isSurvivalMode = false) => {
+  if (!isSurvivalMode) return 0;
+  // Survival modunda başlangıçtan itibaren alttan baskı uygula.
+  return Math.min(SURVIVAL_MAX_SHADOW_ROWS, 1 + Math.floor(score / SURVIVAL_SHADOW_SCORE_STEP));
+};
+
+// ─── Seeded PRNG (Deterministic Piece Shuffling) ───────────────────────────
+class SeededRandom {
+  constructor(seed) {
+    this.seed = seed >>> 0; // Ensure unsigned 32-bit
+  }
+
+  next() {
+    this.seed = (this.seed * 1664525 + 1013904223) >>> 0; // LCG
+    return this.seed / 0x100000000; // Convert to [0, 1)
+  }
+
+  nextInt(max) {
+    return Math.floor(this.next() * max);
+  }
+}
 
 // ─── Yardımcılar ──────────────────────────────────────────────────────────────
 function rotate(matrix) {
@@ -133,11 +159,20 @@ function getFlagEmoji(countryCode) {
   return String.fromCodePoint(...codePoints);
 }
 
-function shuffleBag() {
+function shuffleBag(rng = null) {
   const keys = Object.keys(PIECES);
-  for (let i = keys.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [keys[i], keys[j]] = [keys[j], keys[i]];
+  if (!rng) {
+    // Standard Fisher-Yates with Math.random()
+    for (let i = keys.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [keys[i], keys[j]] = [keys[j], keys[i]];
+    }
+  } else {
+    // Seeded Fisher-Yates
+    for (let i = keys.length - 1; i > 0; i--) {
+      const j = rng.nextInt(i + 1);
+      [keys[i], keys[j]] = [keys[j], keys[i]];
+    }
   }
   return keys;
 }
@@ -151,14 +186,16 @@ function randomPiece(state) {
   return freshPiece(key);
 }
 
-function collides(board, piece, dx = 0, dy = 0, shape = null) {
+function collides(board, piece, dx = 0, dy = 0, shape = null, shadowRows = 0) {
   const s = shape || piece.shape;
+  const shadowStart = ROWS - shadowRows;
   for (let r = 0; r < s.length; r++)
     for (let c = 0; c < s[r].length; c++) {
       if (!s[r][c]) continue;
       const nx = piece.x + c + dx;
       const ny = piece.y + r + dy;
       if (nx < 0 || nx >= COLS || ny >= ROWS) return true;
+      if (shadowRows > 0 && ny >= shadowStart) return true;
       if (ny >= 0 && board[ny][nx]) return true;
     }
   return false;
@@ -188,7 +225,7 @@ function drawCell(ctx, col, row, color) {
   ctx.restore();
 }
 
-function drawBoard(ctx, board, piece, gameOver, showGhost) {
+function drawBoard(ctx, board, piece, gameOver, showGhost, shadowRows = 0) {
   ctx.fillStyle = "#060610";
   ctx.fillRect(0, 0, COLS * CELL, ROWS * CELL);
   ctx.save();
@@ -206,11 +243,29 @@ function drawBoard(ctx, board, piece, gameOver, showGhost) {
     for (let c = 0; c < COLS; c++)
       if (board[r][c]) drawCell(ctx, c, r, COLORS[board[r][c]]);
 
+  if (shadowRows > 0) {
+    const y = (ROWS - shadowRows) * CELL;
+    const h = shadowRows * CELL;
+    const grad = ctx.createLinearGradient(0, y - CELL * 0.4, 0, y + h);
+    grad.addColorStop(0, "rgba(10,10,16,0.30)");
+    grad.addColorStop(1, "rgba(2,2,6,0.92)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, y, COLS * CELL, h);
+    ctx.strokeStyle = "rgba(255,255,255,0.12)";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([7, 5]);
+    ctx.beginPath();
+    ctx.moveTo(0, y + 0.5);
+    ctx.lineTo(COLS * CELL, y + 0.5);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
   if (!piece || gameOver) return;
 
   if (showGhost) {
     let ghostDY = 0;
-    while (!collides(board, piece, 0, ghostDY + 1)) ghostDY++;
+    while (!collides(board, piece, 0, ghostDY + 1, null, shadowRows)) ghostDY++;
     if (ghostDY > 0) {
       ctx.save();
       for (let r = 0; r < piece.shape.length; r++)
@@ -275,6 +330,280 @@ function drawPreview(ctx, w, h, piece, dimmed = false) {
     ctx.fillText("🔒", w / 2, h - 12);
     ctx.restore();
   }
+}
+
+// ─── Rakip mini-board çizici ──────────────────────────────────────────────────
+function drawMiniBoard(canvas, board) {
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  const cw = canvas.width / COLS;
+  const ch = canvas.height / ROWS;
+  ctx.fillStyle = "#030308";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  if (!board) return;
+  ctx.strokeStyle = "rgba(255,255,255,0.04)";
+  ctx.lineWidth = 0.3;
+  for (let r = 0; r <= ROWS; r++) {
+    ctx.beginPath(); ctx.moveTo(0, r * ch); ctx.lineTo(canvas.width, r * ch); ctx.stroke();
+  }
+  for (let c = 0; c <= COLS; c++) {
+    ctx.beginPath(); ctx.moveTo(c * cw, 0); ctx.lineTo(c * cw, canvas.height); ctx.stroke();
+  }
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      if (!board[r][c]) continue;
+      const color = board[r][c] === "garbage" ? "#3a3a4a" : COLORS[board[r][c]];
+      ctx.fillStyle = color;
+      ctx.fillRect(c * cw + 0.5, r * ch + 0.5, cw - 1, ch - 1);
+      ctx.fillStyle = "rgba(255,255,255,0.18)";
+      ctx.fillRect(c * cw + 1, r * ch + 1, cw - 2, 3);
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 4;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 0.5;
+      ctx.strokeRect(c * cw + 1, r * ch + 1, cw - 2, ch - 2);
+      ctx.shadowBlur = 0;
+    }
+  }
+}
+
+// ─── Düello Lobi Ekranı ──────────────────────────────────────────────────────
+function DuelLobby({ savedNickname, onCreateRoom, onJoinRoom, onClose }) {
+  const nickRef = useRef(null);
+  const codeRef = useRef(null);
+  const [tab, setTab] = useState("create"); // "create" | "join"
+  const [menuIndex, setMenuIndex] = useState(0); // 0: primary action, 1: cancel
+  const [gameMode, setGameMode] = useState("survival"); // "survival" | "score"
+  const [targetScoreInput, setTargetScoreInput] = useState("5000");
+
+  const getTargetScoreValue = () => {
+    const parsed = parseInt(targetScoreInput, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 5000;
+  };
+
+  const handleCreate = () => {
+    const nick = nickRef.current?.value?.trim() || savedNickname || "Player";
+    if (nick.length < 2) { alert("En az 2 karakterlik isim gir."); return; }
+    onCreateRoom(nick, gameMode, getTargetScoreValue());
+  };
+
+  const handleJoin = () => {
+    const nick = nickRef.current?.value?.trim() || savedNickname || "Player";
+    const code = codeRef.current?.value?.trim();
+    if (nick.length < 2) { alert("En az 2 karakterlik isim gir."); return; }
+    if (!code || code.length < 6) { alert("Geçerli bir oda kodu gir."); return; }
+    onJoinRoom(code, nick, gameMode, getTargetScoreValue());
+  };
+
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      const tag = e.target?.tagName;
+      const isTyping = tag === "INPUT" || tag === "TEXTAREA";
+
+      if ((e.key === "Backspace" || e.key === "Escape") && !isTyping) {
+        e.preventDefault();
+        onClose();
+        return;
+      }
+
+      if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        setTab("create");
+        return;
+      }
+      if (e.key === "ArrowRight") {
+        e.preventDefault();
+        setTab("join");
+        return;
+      }
+      if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+        e.preventDefault();
+        setMenuIndex((prev) => (prev === 0 ? 1 : 0));
+        return;
+      }
+
+      if (e.key === "Enter") {
+        e.preventDefault();
+        if (menuIndex === 0) {
+          if (tab === "create") handleCreate();
+          else handleJoin();
+        } else {
+          onClose();
+        }
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [menuIndex, onClose, tab]);
+
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.9)", backdropFilter: "blur(6px)" }}>
+      <div style={{ background: "#0a0a1a", border: "1px solid rgba(255,50,82,0.5)", boxShadow: "0 0 60px rgba(255,50,82,0.15)", padding: "2.5rem", minWidth: 320, maxWidth: 380, width: "90vw", fontFamily: "'Press Start 2P', monospace", textAlign: "center" }}>
+        <p style={{ fontSize: "1rem", color: "#ff2052", letterSpacing: "0.2em", marginBottom: "2rem", textShadow: "0 0 20px #ff2052" }}>⚔ DÜELLO</p>
+
+        {/* Nick input */}
+        <input
+          ref={nickRef}
+          type="text"
+          placeholder="Kullanıcı Adı"
+          defaultValue={savedNickname}
+          maxLength={15}
+          style={{ width: "100%", background: "#0d0d20", border: "1px solid #333", color: "#fff", padding: "0.8rem", fontSize: "0.4rem", outline: "none", fontFamily: "inherit", textAlign: "center", marginBottom: "1.5rem" }}
+        />
+
+        {/* Tabs */}
+        <div style={{ display: "flex", marginBottom: "1.5rem", borderBottom: "1px solid #222" }}>
+          {[["create","ODA OLUŞTUR"],["join","KODA GİR"]].map(([t, label]) => (
+            <button key={t} onClick={() => setTab(t)} style={{ flex: 1, background: "transparent", border: "none", color: tab === t ? "#ff2052" : "#444", fontSize: "0.35rem", padding: "0.8rem 0", borderBottom: tab === t ? "2px solid #ff2052" : "2px solid transparent", cursor: "pointer", fontFamily: "inherit" }}>
+              {label}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ marginBottom: "1.5rem" }}>
+          <button
+            onClick={() => setGameMode("survival")}
+            style={{
+              width: "100%",
+              background: gameMode === "survival" ? "#39ff1430" : "#39ff1412",
+              border: "2px solid " + (gameMode === "survival" ? "#39ff14" : "#555"),
+              color: gameMode === "survival" ? "#39ff14" : "#888",
+              padding: "0.7rem 1rem",
+              fontSize: "0.35rem",
+              fontFamily: "inherit",
+              cursor: "pointer",
+              marginBottom: "0.5rem",
+              boxShadow: gameMode === "survival" ? "0 0 15px rgba(57,255,20,0.2)" : "none",
+            }}
+          >
+            HAYATTA KALMA
+          </button>
+          <button
+            onClick={() => setGameMode("score")}
+            style={{
+              width: "100%",
+              background: gameMode === "score" ? "#ffd70030" : "#ffd70012",
+              border: "2px solid " + (gameMode === "score" ? "#ffd700" : "#555"),
+              color: gameMode === "score" ? "#ffd700" : "#888",
+              padding: "0.7rem 1rem",
+              fontSize: "0.35rem",
+              fontFamily: "inherit",
+              cursor: "pointer",
+              boxShadow: gameMode === "score" ? "0 0 15px rgba(255,215,0,0.2)" : "none",
+            }}
+          >
+            PUAN HEDEFI
+          </button>
+        </div>
+        {gameMode === "score" && (
+          <div style={{ marginBottom: "1.5rem" }}>
+            <label style={{ fontSize: "0.3rem", color: "#888", display: "block", marginBottom: "0.3rem" }}>HEDEF:</label>
+            <input
+              type="number"
+              value={targetScoreInput}
+              min={100}
+              onChange={(e) => setTargetScoreInput(e.target.value)}
+              onBlur={() => setTargetScoreInput(String(getTargetScoreValue()))}
+              style={{
+                width: "100%",
+                padding: "0.5rem",
+                fontSize: "0.35rem",
+                fontFamily: "inherit",
+                background: "#1a1a2e",
+                border: "1px solid #ffd700",
+                color: "#ffd700",
+                textAlign: "center",
+              }}
+            />
+          </div>
+        )}
+
+        {tab === "create" ? (
+          <div>
+            <button onClick={handleCreate} style={{ width: "100%", background: menuIndex === 0 ? "#ff205230" : "#ff205215", border: "2px solid #ff2052", color: "#ff2052", padding: "1rem", fontSize: "0.45rem", letterSpacing: "0.15em", cursor: "pointer", fontFamily: "inherit", boxShadow: menuIndex === 0 ? "0 0 26px rgba(255,32,82,0.3)" : "0 0 20px rgba(255,32,82,0.2)" }}
+              onFocus={() => setMenuIndex(0)}
+              onPointerEnter={e => e.currentTarget.style.background = "#ff205230"}
+              onPointerLeave={e => e.currentTarget.style.background = "#ff205215"}>
+              ODA OLUŞTUR
+            </button>
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
+            <input ref={codeRef} type="text" placeholder="ODA KODU (6 hane)" maxLength={6}
+              style={{ width: "100%", background: "#0d0d20", border: "1px solid #333", color: "#fff", padding: "0.8rem", fontSize: "0.4rem", outline: "none", fontFamily: "inherit", textAlign: "center", letterSpacing: "0.3em" }}
+              onInput={e => { e.target.value = e.target.value.toUpperCase(); }}
+            />
+            <button onClick={handleJoin} style={{ width: "100%", background: menuIndex === 0 ? "#ff205230" : "#ff205215", border: "2px solid #ff2052", color: "#ff2052", padding: "1rem", fontSize: "0.45rem", letterSpacing: "0.15em", cursor: "pointer", fontFamily: "inherit", boxShadow: menuIndex === 0 ? "0 0 26px rgba(255,32,82,0.3)" : "none" }}
+              onFocus={() => setMenuIndex(0)}
+              onPointerEnter={e => e.currentTarget.style.background = "#ff205230"}
+              onPointerLeave={e => e.currentTarget.style.background = "#ff205215"}>
+              KATIL
+            </button>
+          </div>
+        )}
+
+        <button onClick={onClose} onFocus={() => setMenuIndex(1)} style={{ marginTop: "1.5rem", background: "transparent", border: "none", color: menuIndex === 1 ? "#aaa" : "#333", fontSize: "0.3rem", cursor: "pointer", fontFamily: "inherit", textDecoration: menuIndex === 1 ? "underline" : "none" }}>
+          İPTAL
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Düello Bekleme / Sonuç Ekranı ────────────────────────────────────────────
+function DuelStatusOverlay({ status, roomCode, opponentNickname, winner, countdownVal, onDisconnect }) {
+  if (status === "idle" || status === "playing") return null;
+
+  if (status === "finished") {
+    const won = winner === "you";
+    return (
+      <div style={{ position: "fixed", inset: 0, zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.92)", backdropFilter: "blur(8px)" }}>
+        <div style={{ textAlign: "center", fontFamily: "'Press Start 2P', monospace" }}>
+          <p style={{ fontSize: "2rem", marginBottom: "1rem", color: won ? "#39ff14" : "#ff2052", textShadow: `0 0 30px ${won ? "#39ff14" : "#ff2052"}`, animation: "pulse 1s ease infinite" }}>
+            {won ? "🏆 KAZANDIN!" : "💀 KAYBETTİN"}
+          </p>
+          <p style={{ fontSize: "0.45rem", color: "#555", marginBottom: "2rem" }}>
+            {won ? `${opponentNickname} oyunu bıraktı` : `${opponentNickname} kazandı`}
+          </p>
+          <button onClick={onDisconnect} style={{ background: "transparent", border: "2px solid #00f5ff", color: "#00f5ff", padding: "1rem 2rem", fontSize: "0.5rem", cursor: "pointer", fontFamily: "inherit" }}>
+            MENÜYE DÖN
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (status === "countdown") {
+    return (
+      <div style={{ position: "fixed", inset: 0, zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.85)", backdropFilter: "blur(4px)", pointerEvents: "none" }}>
+        <p style={{ fontFamily: "'Press Start 2P', monospace", fontSize: countdownVal === 0 ? "3rem" : "5rem", color: countdownVal === 0 ? "#39ff14" : "#ff2052", textShadow: `0 0 40px ${countdownVal === 0 ? "#39ff14" : "#ff2052"}`, animation: "pop 0.4s ease-out" }}>
+          {countdownVal === 0 ? "GO!" : countdownVal}
+        </p>
+      </div>
+    );
+  }
+
+  // waiting
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.9)", backdropFilter: "blur(6px)" }}>
+      <div style={{ textAlign: "center", fontFamily: "'Press Start 2P', monospace", padding: "2.5rem" }}>
+        <p style={{ fontSize: "0.5rem", color: "#00f5ff", marginBottom: "2rem", letterSpacing: "0.2em" }}>ODA BEKLENİYOR</p>
+        <p style={{ fontSize: "1.5rem", color: "#ffd700", letterSpacing: "0.4em", marginBottom: "0.5rem", textShadow: "0 0 20px #ffd700" }}>{roomCode}</p>
+        <p style={{ fontSize: "0.3rem", color: "#444", marginBottom: "2rem" }}>Bu kodu rakibine ver</p>
+        <button onClick={() => navigator.clipboard?.writeText(roomCode)} style={{ background: "#ffd70015", border: "1px solid #ffd700", color: "#ffd700", padding: "0.6rem 1.2rem", fontSize: "0.3rem", cursor: "pointer", fontFamily: "inherit", marginBottom: "1.5rem" }}>
+          KODU KOPYALA
+        </button>
+        <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", justifyContent: "center", marginBottom: "2rem" }}>
+          <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#00f5ff", animation: "pulse 1.2s ease infinite" }} />
+          <p style={{ fontSize: "0.3rem", color: "#555" }}>Rakip bekleniyor...</p>
+        </div>
+        <button onClick={onDisconnect} style={{ background: "transparent", border: "none", color: "#333", fontSize: "0.3rem", cursor: "pointer", fontFamily: "inherit" }}>
+          İPTAL
+        </button>
+      </div>
+    </div>
+  );
 }
 
 // ─── Ayarlar Paneli ───────────────────────────────────────────────────────────
@@ -413,17 +742,21 @@ function MobileBtn({ label, onAction, repeat = false, color = "#00f5ff", style: 
 
 // ─── Ana Bileşen ──────────────────────────────────────────────────────────────
 export default function Tetris() {
-  const canvasRef     = useRef(null);
-  const nextCanvasRef = useRef(null);
-  const holdCanvasRef = useRef(null);
-  const rafRef        = useRef(null);
-  const touchRef      = useRef(null);
+  const canvasRef         = useRef(null);
+  const nextCanvasRef     = useRef(null);
+  const holdCanvasRef     = useRef(null);
+  const opponentCanvasRef = useRef(null);
+  const rafRef            = useRef(null);
+  const touchRef          = useRef(null);
+  // duelRef: game-loop içinden erişilebilen duel köprüsü
+  const duelRef = useRef({ active: false, pendingGarbage: 0, sendBoard: null, sendAttack: null, sendGameOver: null });
 
   const g = useRef({
     board: emptyBoard(), piece: null, next: null,
     hold: null,       // hold slotundaki parça
     canHold: true,    // her parçada 1 kez hold hakkı
     bag: [], bagIndex: 0,
+    shadowRows: 0,
     inputs: {},       // Klavye giriş takibi { key: { held: bool, timer: number, repeating: bool } }
     score: 0, lines: 0, level: 1,
     gameOver: false, running: false, paused: false,
@@ -441,8 +774,15 @@ export default function Tetris() {
   });
 
   const [settings, setSettings] = useState(() => {
+    const defaults = { showButtons: true, showGhost: true, hideLocation: false };
     const saved = localStorage.getItem("tetris_settings");
-    return saved ? JSON.parse(saved) : { showButtons: true, showGhost: true, hideLocation: false };
+    if (!saved) return defaults;
+    try {
+      const parsed = JSON.parse(saved);
+      return { ...defaults, ...parsed };
+    } catch {
+      return defaults;
+    }
   });
 
   const [showSettings, setShowSettings] = useState(false);
@@ -451,18 +791,129 @@ export default function Tetris() {
   const [leaderboard, setLeaderboard] = useState([]);
   const [userRank, setUserRank] = useState({ global: 0, country: 0, city: 0 });
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [showDuelLobby, setShowDuelLobby] = useState(false);
+  const [mainMenuIndex, setMainMenuIndex] = useState(0); // 0: start, 1: duel
+  const [duelFinishMenuIndex, setDuelFinishMenuIndex] = useState(0); // 0: rematch, 1: back to menu
+
+  // ── Duel Hook ─────────────────────────────────────────────────────────────
+  const duel = useDuel({
+    onGarbageReceived: (lines) => { duelRef.current.pendingGarbage += lines; },
+    onOpponentGameOver: () => { /* kazandın overlay useDuel status'dan gelir */ },
+  });
+
+  const resetToMenu = useCallback(() => {
+    cancelAnimationFrame(rafRef.current);
+    const state = g.current;
+    state.board = emptyBoard();
+    state.piece = null;
+    state.next = null;
+    state.hold = null;
+    state.canHold = true;
+    state.bag = [];
+    state.bagIndex = 0;
+    state.inputs = {};
+    state.score = 0;
+    state.lines = 0;
+    state.level = 1;
+    state.gameOver = false;
+    state.running = false;
+    state.paused = false;
+    state.lastTime = 0;
+    state.dropInterval = getDropInterval(1);
+    state.accumulated = 0;
+    state.lockTimer = 0;
+    state.lockResets = 0;
+    state.shadowRows = 0;
+    state.comboCount = -1;
+    state.isBackToBack = false;
+    state.lastMoveWasRotation = false;
+    duelRef.current.pendingGarbage = 0;
+    setUi(prev => ({
+      ...prev,
+      score: 0,
+      lines: 0,
+      level: 1,
+      gameOver: false,
+      running: false,
+      paused: false,
+      message: "",
+    }));
+  }, []);
+
+  const handleDuelCreateRoom = useCallback((nickname, mode = "survival", target = 5000) => {
+    localStorage.setItem("tetris_nick", nickname);
+    setUi(prev => ({ ...prev, savedNickname: nickname }));
+    const code = duel.createRoom(nickname, mode, target);
+    if (code) setShowDuelLobby(false);
+  }, [duel]);
+
+  const handleDuelJoinRoom = useCallback((code, nickname, mode = "survival", target = 5000) => {
+    localStorage.setItem("tetris_nick", nickname);
+    setUi(prev => ({ ...prev, savedNickname: nickname }));
+    const joined = duel.joinRoom(code, nickname, mode, target);
+    if (joined) setShowDuelLobby(false);
+  }, [duel]);
+
+  const handleDuelDisconnect = useCallback(() => {
+    duel.disconnect();
+    resetToMenu();
+    setShowDuelLobby(false);
+  }, [duel, resetToMenu]);
+
+  const handleDuelRematch = useCallback(() => {
+    duel.sendRematchRequest();
+  }, [duel]);
+
+  useEffect(() => {
+    if (duel.status !== "finished") {
+      setDuelFinishMenuIndex(0);
+    }
+  }, [duel.status]);
+
+  // duelRef'i güncel tut (game loop'tan erişim için)
+  useEffect(() => {
+    duelRef.current.active      = duel.status === "playing";
+    duelRef.current.sendBoard   = duel.sendBoard;
+    duelRef.current.sendAttack  = duel.sendAttack;
+    duelRef.current.sendGameOver = duel.sendGameOver;
+    duelRef.current.seed        = duel.seed;
+    duelRef.current.gameMode    = duel.gameMode;
+    duelRef.current.targetScore = duel.targetScore;
+  }, [duel.status, duel.sendBoard, duel.sendAttack, duel.sendGameOver, duel.seed, duel.gameMode, duel.targetScore]);
+
+  // Duel playing başladığında oyunu başlat
+  useEffect(() => {
+    if (duel.status === "playing") {
+      startGame();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [duel.status]);
+
+  // Rakibin board'u değişince mini canvas'a çiz
+  useEffect(() => {
+    drawMiniBoard(opponentCanvasRef.current, duel.opponentBoard);
+  }, [duel.opponentBoard]);
+
+  // Duel bittikten sonra oyunu durdur
+  useEffect(() => {
+    if (duel.status === "finished") {
+      const s = g.current;
+      s.running = false;
+      cancelAnimationFrame(rafRef.current);
+    }
+  }, [duel.status]);
 
   useEffect(() => {
     setIsTouch('ontouchstart' in window || navigator.maxTouchPoints > 0);
     
     // Çok Kanallı Konum Tespiti (Fallback Sistemi)
     const fetchGeo = async () => {
-      // 1. Birincil Deneme (FreeIPAPI)
+      // 1. Birincil Deneme (IPWho.is)
       try {
-        const res = await fetch("https://freeipapi.com/api/json");
+        const res = await fetch("https://ipwho.is/");
         const data = await res.json();
-        if (data.cityName && data.countryName) {
-          setGeo({ city: data.cityName, country: data.countryName, countryCode: data.countryCode || "" });
+        if (data.success !== false && data.city && data.country) {
+          setGeo({ city: data.city, country: data.country, countryCode: data.country_code || "" });
           return;
         }
       } catch (e) { console.warn("Primary geo failed, trying fallback..."); }
@@ -511,10 +962,14 @@ export default function Tetris() {
     const nCvs = nextCanvasRef.current;
     const hCvs = holdCanvasRef.current;
     if (!cvs || !nCvs || !hCvs) return;
-    const { board, piece, next, hold, canHold, gameOver } = g.current;
-    drawBoard(cvs.getContext("2d"), board, piece, gameOver, settingsRef.current.showGhost);
+    const { board, piece, next, hold, canHold, gameOver, shadowRows } = g.current;
+    drawBoard(cvs.getContext("2d"), board, piece, gameOver, settingsRef.current.showGhost, shadowRows);
     drawPreview(nCvs.getContext("2d"), 110, 82, next);
     drawPreview(hCvs.getContext("2d"), 110, 82, hold, !canHold);
+    // Duel board sync
+    if (duelRef.current.active && duelRef.current.sendBoard) {
+      duelRef.current.sendBoard(board, g.current.score);
+    }
   }, []);
 
   // ── Satır silme ───────────────────────────────────────────────────────────
@@ -557,6 +1012,10 @@ export default function Tetris() {
           if (ny < 0) {
             state.gameOver = true; state.running = false;
             setUi(u => ({ ...u, gameOver: true, running: false }));
+            // Düello: game over bildir
+            if (duelRef.current.active && duelRef.current.sendGameOver) {
+              duelRef.current.sendGameOver();
+            }
             return;
           }
           board[ny][piece.x + c] = piece.color;
@@ -617,10 +1076,38 @@ export default function Tetris() {
     state.lockTimer = 0;
     state.lockResets = 0;
     state.lastMoveWasRotation = false;
+
     state.piece = { ...state.next, shape: state.next.shape.map(r => [...r]), x: 3, y: 0 };
     state.next = randomPiece(state);
 
-    if (collides(board, state.piece)) { state.gameOver = true; state.running = false; }
+    if (collides(board, state.piece, 0, 0, null, state.shadowRows)) {
+      state.gameOver = true; state.running = false;
+      if (duelRef.current.active && duelRef.current.sendGameOver) {
+        duelRef.current.sendGameOver();
+      }
+    }
+
+    // Score mode: check win condition (reached target score)
+    if (duelRef.current.active && duelRef.current.gameMode === "score") {
+      if (state.score >= duelRef.current.targetScore) {
+        state.gameOver = true; state.running = false;
+        if (duelRef.current.sendGameOver) {
+          duelRef.current.sendGameOver(); // They win by reaching score
+        }
+      }
+    }
+
+    const isSurvivalMode = duelRef.current.active && duelRef.current.gameMode === "survival";
+    const prevShadowRows = state.shadowRows;
+    const nextShadowRows = getShadowRows(state.score, isSurvivalMode);
+    if (nextShadowRows > prevShadowRows) {
+      const start = ROWS - nextShadowRows;
+      const end = ROWS - prevShadowRows;
+      for (let r = start; r < end; r++) {
+        board[r] = Array(COLS).fill(null);
+      }
+      state.shadowRows = nextShadowRows;
+    }
     
     const newBest = Math.max(ui.bestScore, state.score);
     setUi(prev => ({ 
@@ -639,11 +1126,11 @@ export default function Tetris() {
   const btnLeft = useCallback(() => {
     const s = g.current;
     if (!s.running || !s.piece || s.paused) return;
-    if (!collides(s.board, s.piece, -1, 0)) { 
+    if (!collides(s.board, s.piece, -1, 0, null, s.shadowRows)) { 
       s.piece.x--; 
       s.lastMoveWasRotation = false; // Hareket rotasyonu bozar
       // Reset lock timer if grounded
-      if (collides(s.board, s.piece, 0, 1) && s.lockResets < MAX_LOCK_RESETS) {
+      if (collides(s.board, s.piece, 0, 1, null, s.shadowRows) && s.lockResets < MAX_LOCK_RESETS) {
         s.lockTimer = 0;
         s.lockResets++;
       }
@@ -654,11 +1141,11 @@ export default function Tetris() {
   const btnRight = useCallback(() => {
     const s = g.current;
     if (!s.running || !s.piece || s.paused) return;
-    if (!collides(s.board, s.piece, 1, 0)) { 
+    if (!collides(s.board, s.piece, 1, 0, null, s.shadowRows)) { 
       s.piece.x++; 
       s.lastMoveWasRotation = false;
       // Reset lock timer if grounded
-      if (collides(s.board, s.piece, 0, 1) && s.lockResets < MAX_LOCK_RESETS) {
+      if (collides(s.board, s.piece, 0, 1, null, s.shadowRows) && s.lockResets < MAX_LOCK_RESETS) {
         s.lockTimer = 0;
         s.lockResets++;
       }
@@ -669,7 +1156,7 @@ export default function Tetris() {
   const btnDown = useCallback(() => {
     const s = g.current;
     if (!s.running || !s.piece || s.paused) return;
-    if (!collides(s.board, s.piece, 0, 1)) { 
+    if (!collides(s.board, s.piece, 0, 1, null, s.shadowRows)) { 
       s.piece.y++; 
       s.score += 1; 
       s.lockTimer = 0;
@@ -689,7 +1176,7 @@ export default function Tetris() {
       [0, 0], [1, 0], [-1, 0], [0, -1], [2, 0], [-2, 0], [1, -1], [-1, -1], [0, -2]
     ];
     for (const [dx, dy] of offsets) {
-      if (!collides(state.board, state.piece, dx, dy, rotated)) {
+      if (!collides(state.board, state.piece, dx, dy, rotated, state.shadowRows)) {
         state.piece.shape = rotated;
         state.piece.x += dx;
         state.piece.y += dy;
@@ -704,7 +1191,7 @@ export default function Tetris() {
     tryRotate(); 
     s.lastMoveWasRotation = true; // Rotasyon flagini set et
     // Reset lock timer if grounded after rotation
-    if (collides(s.board, s.piece, 0, 1) && s.lockResets < MAX_LOCK_RESETS) {
+    if (collides(s.board, s.piece, 0, 1, null, s.shadowRows) && s.lockResets < MAX_LOCK_RESETS) {
       s.lockTimer = 0;
       s.lockResets++;
     }
@@ -775,7 +1262,7 @@ export default function Tetris() {
 
     handleInputs(delta);
 
-    const isGrounded = collides(state.board, state.piece, 0, 1);
+    const isGrounded = collides(state.board, state.piece, 0, 1, null, state.shadowRows);
 
     if (isGrounded) {
       // Yere değiyor: Kilitlenme zamanlayıcısını biriktir
@@ -814,12 +1301,30 @@ export default function Tetris() {
     state.accumulated = 0;
     state.lockTimer = 0;
     state.lockResets = 0;
-    state.bag = shuffleBag();
+
+    const isSurvivalMode = duelRef.current.active && duelRef.current.gameMode === "survival";
+    state.shadowRows = getShadowRows(0, isSurvivalMode);
+    if (state.shadowRows > 0) {
+      for (let r = ROWS - state.shadowRows; r < ROWS; r++) {
+        state.board[r] = Array(COLS).fill(null);
+      }
+    }
+
+    // Seeded piece generation for duel mode
+    if (duelRef.current.seed) {
+      const rng = new SeededRandom(duelRef.current.seed);
+      state.bag = shuffleBag(rng);
+    } else {
+      state.bag = shuffleBag();
+    }
+
     state.bagIndex = 0;
     state.piece = randomPiece(state);
     state.next = randomPiece(state);
     state.hold = null;
     state.canHold = true;
+    // Duel: önceki turdan kalan çöp satırları temizle
+    duelRef.current.pendingGarbage = 0;
 
     setUi(prev => ({ 
       ...prev,
@@ -833,9 +1338,35 @@ export default function Tetris() {
 
   const togglePause = useCallback(() => {
     const s = g.current;
-    if (!s.running || s.gameOver) return;
+    // Duel modunda pause yasak
+    if (!s.running || s.gameOver || duelRef.current.active) return;
     s.paused = !s.paused;
     setUi(prev => ({ ...prev, paused: s.paused }));
+  }, []);
+
+  // Sekme/pencere odağı kaybolunca oyunu otomatik duraklat
+  useEffect(() => {
+    const autoPause = () => {
+      const s = g.current;
+      if (!s.running || s.gameOver || s.paused || duelRef.current.active) return;
+      s.paused = true;
+      // Focus kaybında basılı tuşlar takılı kalmasın
+      Object.keys(s.inputs).forEach((key) => {
+        s.inputs[key].held = false;
+      });
+      setUi(prev => ({ ...prev, paused: true }));
+    };
+
+    const onVisibilityChange = () => {
+      if (document.hidden) autoPause();
+    };
+
+    window.addEventListener("blur", autoPause);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.removeEventListener("blur", autoPause);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
   }, []);
 
   const resumeGame = useCallback(() => {
@@ -896,40 +1427,9 @@ export default function Tetris() {
     };
 
     try {
-      // 1. İsim kontrolü
-      const { data: existing, error: checkError } = await supabase
-        .from('leaderboard')
-        .select('*')
-        .eq('username', username)
-        .maybeSingle();
-
-      if (checkError) throw checkError;
-
-      if (existing) {
-        // Eğer isim varsa, skoru güncelle (sadece yenisi daha yüksekse)
-        if (score > existing.score) {
-          const { error: updateError } = await supabase
-            .from('leaderboard')
-            .update({ 
-              score: score,
-              city: scoreData.city,
-              country: scoreData.country,
-              country_code: scoreData.country_code
-            })
-            .eq('username', username);
-          
-          if (updateError) throw updateError;
-        } else {
-          alert("Bu isimle zaten daha yüksek veya eşit bir skorun var!");
-          setIsSubmitting(false);
-          await getRanks(score);
-          return;
-        }
-      } else {
-        // 2. Yeni isim ise Supabase'e ekle
-        const { error: insertError } = await supabase.from('leaderboard').insert([scoreData]);
-        if (insertError) throw insertError;
-      }
+      // Direkt yeni skor ekle
+      const { error: insertError } = await supabase.from('leaderboard').insert([scoreData]);
+      if (insertError) throw insertError;
       
       // 3. IndexedDB'ye de yedekle (synced: true olarak)
       const db = await initDB();
@@ -961,7 +1461,7 @@ export default function Tetris() {
     const s = g.current;
     if (!s.running || !s.piece || s.paused) return;
     let drop = 0;
-    while (!collides(s.board, s.piece, 0, drop + 1)) drop++;
+    while (!collides(s.board, s.piece, 0, drop + 1, null, s.shadowRows)) drop++;
     s.piece.y += drop;
     s.score += drop * 2;
     lockPiece(); render();
@@ -971,6 +1471,57 @@ export default function Tetris() {
   useEffect(() => {
     const handleKeyDown = (e) => {
       const state = g.current;
+      const tag = e.target?.tagName;
+      const isTyping = tag === "INPUT" || tag === "TEXTAREA";
+
+      // Pause toggle her durumda çalışsın (running ise)
+      if (e.key === "p" || e.key === "P" || e.key === "Escape") {
+        e.preventDefault();
+        togglePause();
+        return;
+      }
+
+      if (!isTyping && !ui.running && duel.status === "idle" && !showDuelLobby) {
+        if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)) {
+          e.preventDefault();
+          setMainMenuIndex((prev) => (prev === 0 ? 1 : 0));
+          return;
+        }
+        if (e.key === "Enter") {
+          e.preventDefault();
+          if (mainMenuIndex === 0) startGame();
+          else setShowDuelLobby(true);
+          return;
+        }
+      }
+
+      if (!isTyping && duel.status === "finished") {
+        if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)) {
+          e.preventDefault();
+          setDuelFinishMenuIndex((prev) => (prev === 0 ? 1 : 0));
+          return;
+        }
+        if (e.key === "Enter") {
+          e.preventDefault();
+          if (duelFinishMenuIndex === 0) handleDuelRematch();
+          else handleDuelDisconnect();
+          return;
+        }
+        if (e.key === "Backspace") {
+          e.preventDefault();
+          handleDuelDisconnect();
+          return;
+        }
+      }
+
+      if (!isTyping && (duel.status === "waiting" || duel.status === "error")) {
+        if (e.key === "Backspace" || e.key === "Escape") {
+          e.preventDefault();
+          handleDuelDisconnect();
+          return;
+        }
+      }
+
       if (!state.running || !state.piece || state.paused) return;
 
       // DAS/ARR keys (Only initialize timer on first press)
@@ -997,7 +1548,6 @@ export default function Tetris() {
           break;
         case " ": e.preventDefault(); btnHardDrop(); break;
         case "c": case "C": case "Shift": e.preventDefault(); btnHold(); break;
-        case "p": case "P": case "Escape": e.preventDefault(); togglePause(); break;
         default: break;
       }
     };
@@ -1015,7 +1565,11 @@ export default function Tetris() {
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
     };
-  }, [btnLeft, btnRight, btnDown, btnRotate, btnHardDrop, btnHold, togglePause]);
+  }, [
+    btnLeft, btnRight, btnDown, btnRotate, btnHardDrop, btnHold, togglePause,
+    duel.status, duelFinishMenuIndex, handleDuelDisconnect, handleDuelRematch,
+    mainMenuIndex, showDuelLobby, startGame, ui.running,
+  ]);
 
   useEffect(() => () => cancelAnimationFrame(rafRef.current), []);
 
@@ -1038,7 +1592,7 @@ export default function Tetris() {
       const dir = dx > 0 ? 1 : -1;
       const steps = Math.min(Math.floor(adx / SWIPE_THRESHOLD), 5);
       for (let i = 0; i < steps; i++)
-        if (!collides(state.board, state.piece, dir, 0)) state.piece.x += dir;
+        if (!collides(state.board, state.piece, dir, 0, null, state.shadowRows)) state.piece.x += dir;
       render();
     } else if (ady > adx) {
       if (dy > 35) btnHardDrop();
@@ -1082,6 +1636,13 @@ export default function Tetris() {
           width: 150px;
         }
 
+        .duel-panel {
+          display: flex;
+          flex-direction: column;
+          gap: 1.2rem;
+          width: 120px;
+        }
+
         .board-canvas {
           display: block;
           border: 2px solid rgba(0,245,255,0.3);
@@ -1111,6 +1672,11 @@ export default function Tetris() {
           }
           .side-panel {
             display: none !important;
+          }
+
+          .duel-panel {
+            width: min(76vw, 280px);
+            margin-top: 0.75rem;
           }
           
           .mobile-overlay-panel {
@@ -1149,7 +1715,10 @@ export default function Tetris() {
           }
           
           .control-deck {
-            flex: 1;
+            position: fixed;
+            left: 0;
+            right: 0;
+            bottom: 0;
             width: 100%;
             display: flex;
             justify-content: space-between;
@@ -1157,6 +1726,7 @@ export default function Tetris() {
             padding: 0.5rem 1.5rem calc(0.5rem + env(safe-area-inset-bottom)) 1.5rem;
             background: rgba(0,0,0,0.25);
             backdrop-filter: blur(8px);
+            z-index: 40;
           }
 
           .m-btn {
@@ -1215,6 +1785,24 @@ export default function Tetris() {
           </button>
         )}
       </div>
+
+      {showDuelLobby && (
+        <DuelLobby
+          savedNickname={ui.savedNickname}
+          onCreateRoom={handleDuelCreateRoom}
+          onJoinRoom={handleDuelJoinRoom}
+          onClose={() => setShowDuelLobby(false)}
+        />
+      )}
+
+      <DuelStatusOverlay
+        status={duel.status}
+        roomCode={duel.roomCode}
+        opponentNickname={duel.opponentNickname}
+        winner={duel.winner}
+        countdownVal={duel.countdownVal}
+        onDisconnect={handleDuelDisconnect}
+      />
 
       {/* Oyun alanı */}
       <div className="game-layout">
@@ -1290,7 +1878,7 @@ export default function Tetris() {
               {ui.message}
             </div>
           )}
-          {!ui.running && (
+          {!ui.running && duel.status === "idle" && !showDuelLobby && (
             <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "rgba(4,4,12,0.95)", gap: "1.1rem", zIndex: 50, padding: "2rem" }}>
               {ui.gameOver && (
                 <>
@@ -1308,7 +1896,7 @@ export default function Tetris() {
                         <input
                           id="nickname-input"
                           type="text"
-                          placeholder="Unique Nickname"
+                          placeholder="Nickname"
                           defaultValue={ui.savedNickname}
                           maxLength={15}
                           style={{
@@ -1365,13 +1953,41 @@ export default function Tetris() {
               )}
               <button
                 onClick={startGame}
-                style={{ background: "transparent", border: "2px solid #00f5ff", color: "#00f5ff", padding: "1rem 2.5rem", fontSize: "0.85rem", letterSpacing: "0.15em", textShadow: "0 0 10px #00f5ff", boxShadow: "0 0 20px rgba(0,245,255,0.25)", marginTop: "1rem" }}
+                onPointerEnter={() => setMainMenuIndex(0)}
+                style={{ background: mainMenuIndex === 0 ? "rgba(0,245,255,0.12)" : "transparent", border: "2px solid #00f5ff", color: "#00f5ff", padding: "1rem 2.5rem", fontSize: "0.85rem", letterSpacing: "0.15em", textShadow: "0 0 10px #00f5ff", boxShadow: mainMenuIndex === 0 ? "0 0 28px rgba(0,245,255,0.35)" : "0 0 20px rgba(0,245,255,0.25)" }}
               >
                 {ui.gameOver ? "PLAY AGAIN" : "START GAME"}
+              </button>
+              <button
+                onClick={() => setShowDuelLobby(true)}
+                onPointerEnter={() => setMainMenuIndex(1)}
+                style={{ background: mainMenuIndex === 1 ? "rgba(255,32,82,0.20)" : "rgba(255,32,82,0.10)", border: "2px solid #ff2052", color: "#ff2052", padding: "1rem 2rem", fontSize: "0.8rem", letterSpacing: "0.15em", boxShadow: mainMenuIndex === 1 ? "0 0 28px rgba(255,32,82,0.28)" : "0 0 20px rgba(255,32,82,0.18)" }}
+              >
+                ⚔ DÜELLO
               </button>
             </div>
           )}
         </div>
+
+        {duel.status !== "idle" && (
+          <div className="duel-panel">
+            <div>
+              <p style={{ fontSize: "0.55rem", color: "#ff2052", marginBottom: "0.35rem", letterSpacing: "0.1em" }}>RAKİP</p>
+              <div style={{ marginBottom: "0.5rem", padding: "0.45rem", border: "1px solid rgba(255,32,82,0.2)", background: "rgba(0,0,0,0.35)" }}>
+                <p style={{ fontSize: "0.34rem", color: "#ccc", marginBottom: "0.25rem", wordBreak: "break-word" }}>
+                  {duel.opponentNickname || (duel.status === "waiting" ? "BEKLENİYOR" : "RAKİP BAĞLANTI")}
+                </p>
+                <p style={{ fontSize: "0.55rem", color: "#00f5ff", textShadow: "0 0 10px #00f5ff" }}>{duel.opponentScore}</p>
+              </div>
+              <canvas
+                ref={opponentCanvasRef}
+                width={84}
+                height={168}
+                style={{ display: "block", border: "1px solid rgba(255,255,255,0.06)", width: "100%", height: "auto", background: "rgba(0,0,0,0.45)" }}
+              />
+            </div>
+          </div>
+        )}
 
         {/* Sağ panel: NEXT + skor (Masaüstü) */}
         {!isTouch && (
